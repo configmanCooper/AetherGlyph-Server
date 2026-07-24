@@ -4,9 +4,10 @@ This is a separate, asset-free deployment package for Aetherglyph online play.
 It contains only the deterministic simulation, gesture recognizer, matchmaking,
 private rooms, reconnect/resume handling, and optional rating persistence.
 
-It does **not** include or serve Three.js, HTML, graphics, music, screenshots, or
-other client assets. Android, Windows, and web clients carry their own assets and
-connect directly through Socket.IO.
+It does **not** include or serve the game client, Three.js, graphics, music, or
+screenshots. Android, Windows, and web clients carry their own assets and connect
+directly through Socket.IO. It serves only two small required legal HTML pages:
+`/privacy.html` and `/account-deletion.html`.
 
 ## Render deployment
 

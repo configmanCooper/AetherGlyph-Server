@@ -1,5 +1,6 @@
 import express from 'express';
 import http from 'node:http';
+import { dirname, join } from 'node:path';
 import { monitorEventLoopDelay } from 'node:perf_hooks';
 import { fileURLToPath } from 'node:url';
 import { Server } from 'socket.io';
@@ -11,6 +12,8 @@ import { NET } from './shared/src/protocol/net.js';
 import {
   PROTOCOL_VERSION, BALANCE_VERSION, ROSTER_CHECKSUM, APP_PHASE, versionTag,
 } from './shared/src/protocol/version.js';
+
+const ROOT = dirname(fileURLToPath(import.meta.url));
 
 function parseOrigins(value) {
   return String(value || '').split(',').map((origin) => origin.trim()).filter(Boolean);
@@ -76,6 +79,12 @@ export function createGameServer(opts = {}) {
       service: 'aetherglyph-authoritative-server',
       assetsServed: false,
       version: versionTag(),
+    });
+    app.get('/privacy.html', (_request, response) => {
+      response.sendFile(join(ROOT, 'legal', 'privacy.html'));
+    });
+    app.get('/account-deletion.html', (_request, response) => {
+      response.sendFile(join(ROOT, 'legal', 'account-deletion.html'));
     });
   });
 

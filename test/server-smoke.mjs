@@ -19,6 +19,12 @@ try {
   }
   const root = await (await fetch(`http://127.0.0.1:${port}/`)).json();
   if (root.assetsServed !== false) throw new Error('Server unexpectedly serves client assets.');
+  for (const page of ['privacy.html', 'account-deletion.html']) {
+    const legal = await fetch(`http://127.0.0.1:${port}/${page}`);
+    if (!legal.ok || !(await legal.text()).includes('Aetherglyph')) {
+      throw new Error(`Missing legal page: ${page}`);
+    }
+  }
   console.log('server-smoke: PASS');
 } finally {
   await server.close('smoke complete');

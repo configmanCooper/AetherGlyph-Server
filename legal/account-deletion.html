@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#0a0713" />
+  <title>Aetherglyph — Account &amp; Data Deletion</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; padding: 24px 18px 60px; background: #0a0713; color: #ece7f6;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; line-height: 1.55;
+      max-width: 760px; margin-inline: auto; }
+    h1 { color: #8b6bff; font-size: 26px; }
+    h2 { color: #4fd6c9; font-size: 18px; margin-top: 28px; }
+    a { color: #8b6bff; }
+    code { background: rgba(255,255,255,0.08); padding: 1px 5px; border-radius: 5px; }
+    .muted { color: #a99fc4; font-size: 13px; }
+    ol, ul { padding-left: 20px; }
+    .back { display: inline-block; margin-top: 30px; padding: 10px 16px; border-radius: 10px;
+      background: rgba(139,107,255,0.2); border: 1px solid rgba(139,107,255,0.4); color: #ece7f6;
+      text-decoration: none; }
+  </style>
+</head>
+<body>
+  <h1>Account &amp; Data Deletion</h1>
+  <p class="muted">Aetherglyph: Arcane Duels · Publisher: configmanCooper ·
+    Contact: <a href="mailto:rocmat21@gmail.com">rocmat21@gmail.com</a></p>
+
+  <p>Aetherglyph has <strong>no accounts and no sign-in</strong>. Your identity is a random, anonymous
+  identifier stored only on your device. Because there is no account, deletion is simple and mostly
+  under your direct control.</p>
+
+  <h2>1. Delete everything on your device</h2>
+  <p>In the app, open <strong>Settings → Delete my data</strong>. This immediately erases from this
+  device:</p>
+  <ul>
+    <li>your anonymous identifier,</li>
+    <li>your optional display name,</li>
+    <li>your saved settings and configured service URL,</li>
+    <li>any saved reconnect token for an in-progress duel,</li>
+    <li>your solo progress: tutorial &amp; campaign completion, gesture calibration, mastery medals,
+      secret-spell clues and discoveries, per-spell guide stages, Practice vs AI settings and
+      difficulty results, and local coaching statistics
+      (stored under <code>aeg.solo.v1</code>).</li>
+  </ul>
+  <p>Solo tutorial progress never leaves your device — it is stored only in local storage and is
+  never uploaded. Uninstalling the app also removes all of this local data.</p>
+
+  <h2>2. Delete your server-side rating record</h2>
+  <p>Ranked online play stores a numeric skill rating and match result tied to your anonymous
+  identifier on the game service. To request deletion of that record:</p>
+  <ol>
+    <li>Before deleting local data, note your anonymous identifier (Settings shows it, or it is the
+      <code>aeth-client-id</code> value in local storage).</li>
+    <li>Email <a href="mailto:rocmat21@gmail.com">rocmat21@gmail.com</a> with the subject
+      “Aetherglyph data deletion” and include that identifier.</li>
+    <li>The associated rating/result record will be deleted within 30 days. Short-lived connection and
+      security logs expire automatically within 30 days.</li>
+  </ol>
+  <p class="muted">We can only match a deletion request to a record via the anonymous identifier, so
+  please capture it before wiping local data.</p>
+
+  <h2>What is retained</h2>
+  <p>Nothing that identifies you personally is retained. No name, email, or account is required to play.
+  We keep no advertising or analytics profiles.</p>
+
+  <a class="back" href="./index.html">Back to game</a>
+</body>
+</html>
