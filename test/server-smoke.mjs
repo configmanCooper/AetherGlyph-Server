@@ -17,14 +17,14 @@ try {
   if (!health.ok || health.snapshotHz !== 10 || health.service !== 'aetherglyph-server') {
     throw new Error(`Unexpected health response: ${JSON.stringify(health)}`);
   }
-  const root = await (await fetch(`http://127.0.0.1:${port}/`)).json();
-  if (root.assetsServed !== false) throw new Error('Server unexpectedly serves client assets.');
   for (const page of ['privacy.html', 'account-deletion.html']) {
     const legal = await fetch(`http://127.0.0.1:${port}/${page}`);
     if (!legal.ok || !(await legal.text()).includes('Aetherglyph')) {
       throw new Error(`Missing legal page: ${page}`);
     }
   }
+  const root = await (await fetch(`http://127.0.0.1:${port}/`)).json();
+  if (root.assetsServed !== false) throw new Error('Server unexpectedly serves client assets.');
   console.log('server-smoke: PASS');
 } finally {
   await server.close('smoke complete');

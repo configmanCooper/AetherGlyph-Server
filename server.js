@@ -80,12 +80,12 @@ export function createGameServer(opts = {}) {
       assetsServed: false,
       version: versionTag(),
     });
-    app.get('/privacy.html', (_request, response) => {
-      response.sendFile(join(ROOT, 'legal', 'privacy.html'));
-    });
-    app.get('/account-deletion.html', (_request, response) => {
-      response.sendFile(join(ROOT, 'legal', 'account-deletion.html'));
-    });
+  });
+  app.get('/privacy.html', (_request, response) => {
+    response.sendFile(join(ROOT, 'legal', 'privacy.html'));
+  });
+  app.get('/account-deletion.html', (_request, response) => {
+    response.sendFile(join(ROOT, 'legal', 'account-deletion.html'));
   });
 
   app.get('/healthz', (_request, response) => {
