@@ -13,6 +13,11 @@ foreach ($name in @('shared', 'server')) {
   Copy-Item -LiteralPath (Join-Path $GameRoot $name) -Destination $target -Recurse -Force
 }
 
+foreach ($unused in @('shared\src\analytics', 'shared\src\bot')) {
+  $path = Join-Path $root $unused
+  if (Test-Path $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+}
+
 $netPath = Join-Path $root 'shared\src\protocol\net.js'
 $net = Get-Content $netPath -Raw
 if (!$net.Contains('SNAPSHOT_HZ: 15') -or !$net.Contains('SNAPSHOT_EVERY_TICKS: 4')) {
