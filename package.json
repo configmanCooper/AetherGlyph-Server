@@ -1,0 +1,23 @@
+{
+  "name": "aetherglyph-render-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Asset-free authoritative matchmaking and duel server for Aetherglyph.",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test/server-smoke.mjs",
+    "load:500": "node test/load-500.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "pg": "^8.22.0",
+    "socket.io": "^4.8.3"
+  },
+  "devDependencies": {
+    "socket.io-client": "^4.8.3"
+  }
+}
