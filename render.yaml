@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: aetherglyph
+    name: aetherglyph-server
     runtime: node
     plan: standard
     numInstances: 1
