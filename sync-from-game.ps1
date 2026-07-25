@@ -19,7 +19,7 @@ foreach ($unused in @('shared\src\analytics', 'shared\src\bot')) {
 }
 
 $netPath = Join-Path $root 'shared\src\protocol\net.js'
-$net = Get-Content $netPath -Raw
+$net = [IO.File]::ReadAllText($netPath, [Text.UTF8Encoding]::new($false))
 if (!$net.Contains('SNAPSHOT_HZ: 15') -or !$net.Contains('SNAPSHOT_EVERY_TICKS: 4')) {
   throw 'Could not locate default snapshot cadence in shared protocol source.'
 }
@@ -28,7 +28,7 @@ $net = $net.Replace('SNAPSHOT_EVERY_TICKS: 4', 'SNAPSHOT_EVERY_TICKS: 6')
 [IO.File]::WriteAllText($netPath, $net, [Text.UTF8Encoding]::new($false))
 
 $matchPath = Join-Path $root 'server\matchRoom.js'
-$match = Get-Content $matchPath -Raw
+$match = [IO.File]::ReadAllText($matchPath, [Text.UTF8Encoding]::new($false))
 $old = 'seat.socket.emit(EVENTS.SNAPSHOT, {'
 $new = '(force ? seat.socket : seat.socket.volatile).emit(EVENTS.SNAPSHOT, {'
 if (!$match.Contains($old)) { throw 'Could not locate snapshot emit for volatile optimization.' }

@@ -76,10 +76,10 @@ export const SPELL_EFFECTS = {
     conductReaction: true,
     conditionalStun: { needs: 'soakedOrStatic2', staticStacks: 2, durationS: 0.8, grantsTenacity: true },
   },
-  8: { // Fireball — heavy area, destroys cover
+  8: { // Fireball — heavy area, devastating against cover
     type: PROJECTILE, damage: 30, status: { name: 'Burning', stacks: 1 }, charges: 1,
     travelS: 0.55, homing: 0, dodgeRadius: 0.55, area: true, school: 'Ember', reflectable: false,
-    destroysCover: true, igniteOil: true,
+    destroysCover: true, coverDamageMul: 3, igniteOil: true,
   },
   9: { // Ice Comet — heavy area
     type: PROJECTILE, damage: 26, status: { name: 'Chilled', stacks: 1 }, charges: 1,
@@ -133,10 +133,10 @@ export const SPELL_EFFECTS = {
   31: { type: ZONE, zoneKind: 'Oil', school: 'Ember' }, // Oil Script
   32: { type: ZONE, zoneKind: 'Wet', dousesBurning: true, school: 'Tide' }, // Rain Glyph
   33: { type: ZONE, zoneKind: 'Gust', deflect: true, deflectWindowS: 1.2, movesZones: true, knockdown: true, school: 'Gale' }, // Gust Wall
-  34: { // Quake — area damage + interrupt + destroy cover
+  34: { // Quake — area damage + interrupt + devastating cover damage
     type: PROJECTILE, damage: 10, interrupt: true, knockdown: true, destroysCover: true, status: null, charges: 1,
     travelS: 0.2, homing: 0, dodgeRadius: 0.5, area: true, school: 'Stone', reflectable: false,
-    quake: true,
+    quake: true, coverDamageMul: 6,
   },
   35: { type: ZONE, zoneKind: 'Fog', school: 'Gale' }, // Fog Cloud
   36: { type: ZONE, zoneKind: 'Snare', school: 'Arcane' }, // Rune Snare

@@ -14,7 +14,7 @@ export const NET = Object.freeze({
   // The authoritative tick equals the shared Sim's fixed tick so the exact same
   // deterministic simulation runs server-side (no divergent tick constant).
   TICK_HZ: 60,
-  SNAPSHOT_HZ: 10,               // bandwidth-tuned snapshot + event flush rate
+  SNAPSHOT_HZ: 10,               // bounded snapshot + event flush rate
   SNAPSHOT_EVERY_TICKS: 6,       // TICK_HZ / SNAPSHOT_HZ
   INPUT_HZ: 20,                  // client movement/focus/brace cadence cap
 

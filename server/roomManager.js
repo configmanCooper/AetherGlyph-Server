@@ -35,9 +35,11 @@ export class RoomManager {
     this.graceMs = opts.graceMs;
     this.intermissionMs = opts.intermissionMs;
     this.waitingRooms = new Map(); // code -> { code, host }
+    this.privateLobbies = new Map(); // code -> { code, seats, ready }
     this.queue = [];               // { socket, accountId, name, loadoutIds, rating, since }
     this.matches = new Map();      // matchId -> MatchRoom
     this.draining = false;
+    this.populationTimer = null;
     this.matchmakeTimer = setInterval(() => this.matchmake(), 1000);
     if (this.matchmakeTimer.unref) this.matchmakeTimer.unref();
   }
@@ -47,32 +49,36 @@ export class RoomManager {
     socket.data.accountId = sanitizeAccountId(socket.handshake.auth && socket.handshake.auth.clientId) || `anon-${randomId(6)}`;
     socket.data.name = sanitizeName(socket.handshake.auth && socket.handshake.auth.name, `Wizard-${socket.data.accountId.slice(-4)}`);
     socket.data.control = new TokenBucket(5, 8); // create/join/quick spam guard
-    socket.data.auxiliary = new TokenBucket(10, 20); // ping/resume/leave flood guard
+    socket.data.auxiliary = new TokenBucket(10, 20); // ping/resume/ready/leave flood guard
     socket.data.loc = null;
 
     socket.on(EVENTS.CREATE_ROOM, (p, ack) => this.createRoom(socket, p || {}, ack));
     socket.on(EVENTS.JOIN_ROOM, (p, ack) => this.joinRoom(socket, p || {}, ack));
     socket.on(EVENTS.QUICK_MATCH, (p, ack) => this.quickMatch(socket, p || {}, ack));
     socket.on(EVENTS.CANCEL_QUEUE, (p, ack) => this.cancelQueue(socket, ack));
+    socket.on(EVENTS.PRIVATE_READY, (p, ack) => {
+      if (!socket.data.auxiliary.take()) { this.ack(ack, { ok: false, code: ERR.RATE }); return; }
+      this.privateReady(socket, p || {}, ack);
+    });
     socket.on(EVENTS.LEAVE, (p, ack) => {
-      if (!socket.data.auxiliary.take()) return;
+      if (!socket.data.auxiliary.take()) { this.ack(ack, { ok: false, code: ERR.RATE }); return; }
       this.leave(socket, ack);
     });
     socket.on(EVENTS.INPUT, (p) => this.routeInput(socket, p || {}));
     socket.on(EVENTS.CAST, (p, ack) => this.routeCast(socket, p || {}, ack));
     socket.on(EVENTS.RESUME, (p, ack) => {
-      if (!socket.data.auxiliary.take()) {
-        this.ack(ack, { ok: false, code: ERR.RATE });
-        return;
-      }
+      if (!socket.data.auxiliary.take()) { this.ack(ack, { ok: false, code: ERR.RATE }); return; }
       this.resume(socket, p || {}, ack);
     });
     socket.on(EVENTS.PING, (p) => {
-      if (socket.data.auxiliary.take() && p && Number.isFinite(p.t)) {
-        socket.emit(EVENTS.PONG, { t: p.t });
-      }
+      if (socket.data.auxiliary.take() && p && Number.isFinite(p.t)) socket.emit(EVENTS.PONG, { t: p.t });
     });
-    socket.on('disconnect', () => this.disconnect(socket));
+    socket.on('disconnect', () => {
+      this.disconnect(socket);
+      this.schedulePopulationBroadcast();
+    });
+    socket.emit(EVENTS.POPULATION, this.populationPayload());
+    this.schedulePopulationBroadcast();
   }
 
   ack(fn, payload) { if (typeof fn === 'function') fn(payload); }
@@ -86,6 +92,19 @@ export class RoomManager {
 
   seatInit(socket, loadoutIds) {
     return { accountId: socket.data.accountId, name: socket.data.name, loadoutIds, socket };
+  }
+
+  populationPayload() {
+    return { online: Math.max(0, Number(this.io.engine.clientsCount) || 0) };
+  }
+
+  schedulePopulationBroadcast() {
+    if (this.populationTimer) return;
+    this.populationTimer = setTimeout(() => {
+      this.populationTimer = null;
+      this.io.emit(EVENTS.POPULATION, this.populationPayload());
+    }, 100);
+    if (this.populationTimer.unref) this.populationTimer.unref();
   }
 
   // ---- private rooms -----------------------------------------------------
@@ -181,7 +200,7 @@ export class RoomManager {
       intermissionMs: this.intermissionMs,
       log: this.log,
       onResult: (r) => this.persistResult(r),
-      onClosed: (m) => this.matches.delete(m.matchId),
+      onClosed: (m, reason) => this.matchClosed(m, reason),
     });
     this.matches.set(match.matchId, match);
     for (const seat of match.seats) {
@@ -189,6 +208,72 @@ export class RoomManager {
     }
     match.start();
     return match;
+  }
+
+  matchClosed(match, reason) {
+    this.matches.delete(match.matchId);
+    for (const seat of match.seats) {
+      if (seat.socket?.data?.loc?.matchId === match.matchId) seat.socket.data.loc = null;
+    }
+    if (reason !== 'match-complete' || !match.code || !match.seats.every((seat) => seat.socket?.connected)) return;
+    const lobby = {
+      code: match.code,
+      seats: match.seats.map((seat) => ({
+        accountId: seat.accountId,
+        name: seat.name,
+        loadoutIds: seat.loadoutIds.slice(),
+        socket: seat.socket,
+      })),
+      ready: new Set(),
+    };
+    this.privateLobbies.set(lobby.code, lobby);
+    lobby.seats.forEach((seat, slot) => {
+      seat.socket.data.loc = { type: 'private-lobby', code: lobby.code, slot };
+    });
+    this.broadcastPrivateLobby(lobby);
+  }
+
+  broadcastPrivateLobby(lobby) {
+    const payload = {
+      state: ROOM_STATE.PRIVATE_LOBBY,
+      code: lobby.code,
+      readyCount: lobby.ready.size,
+      playerCount: lobby.seats.length,
+    };
+    for (const seat of lobby.seats) if (seat.socket?.connected) seat.socket.emit(EVENTS.ROOM_UPDATE, payload);
+  }
+
+  privateReady(socket, payload, ack) {
+    const loc = socket.data.loc;
+    const lobby = loc?.type === 'private-lobby' ? this.privateLobbies.get(loc.code) : null;
+    if (!lobby || !lobby.seats[loc.slot] || lobby.seats[loc.slot].socket !== socket) {
+      this.ack(ack, { ok: false, code: ERR.BAD_STATE });
+      return;
+    }
+    const ids = Array.isArray(payload.loadout) ? payload.loadout.map(Number) : null;
+    const v = validateSeatLoadout(ids);
+    if (!v.valid) {
+      this.ack(ack, { ok: false, code: ERR.INVALID_LOADOUT, errors: v.errors });
+      return;
+    }
+    const seat = lobby.seats[loc.slot];
+    seat.loadoutIds = ids;
+    if (payload.name) {
+      socket.data.name = sanitizeName(payload.name, socket.data.name);
+      seat.name = socket.data.name;
+    }
+    lobby.ready.add(loc.slot);
+    this.ack(ack, {
+      ok: true,
+      state: ROOM_STATE.PRIVATE_LOBBY,
+      code: lobby.code,
+      readyCount: lobby.ready.size,
+    });
+    this.broadcastPrivateLobby(lobby);
+    if (lobby.ready.size < lobby.seats.length) return;
+    this.privateLobbies.delete(lobby.code);
+    for (const readySeat of lobby.seats) readySeat.socket.data.loc = null;
+    this.startMatch(lobby.seats, { code: lobby.code, ranked: false });
   }
 
   async persistResult(result) {
@@ -226,7 +311,22 @@ export class RoomManager {
     const loc = socket.data.loc;
     if (loc && loc.type === 'waiting') { this.waitingRooms.delete(loc.code); socket.data.loc = null; }
     else if (loc && loc.type === 'queue') { this.queue = this.queue.filter((e) => e.socket !== socket); socket.data.loc = null; }
-    else if (loc && loc.type === 'match') { const m = this.matches.get(loc.matchId); if (m) m.handleLeave(loc.slot); socket.data.loc = null; }
+    else if (loc && loc.type === 'private-lobby') {
+      const lobby = this.privateLobbies.get(loc.code);
+      if (lobby) {
+        this.privateLobbies.delete(loc.code);
+        for (const seat of lobby.seats) {
+          if (!seat.socket) continue;
+          seat.socket.data.loc = null;
+          if (seat.socket !== socket) seat.socket.emit(EVENTS.ROOM_UPDATE, { state: 'closed', code: loc.code });
+        }
+      }
+      socket.data.loc = null;
+    } else if (loc && loc.type === 'match') {
+      const m = this.matches.get(loc.matchId);
+      if (m) m.handleLeave(loc.slot);
+      if (socket.data.loc?.type === 'match') socket.data.loc = null;
+    }
     this.ack(ack, { ok: true });
   }
 
@@ -247,7 +347,17 @@ export class RoomManager {
     if (!loc) return;
     if (loc.type === 'waiting') { this.waitingRooms.delete(loc.code); }
     else if (loc.type === 'queue') { this.queue = this.queue.filter((e) => e.socket !== socket); }
-    else if (loc.type === 'match') {
+    else if (loc.type === 'private-lobby') {
+      const lobby = this.privateLobbies.get(loc.code);
+      if (lobby) {
+        this.privateLobbies.delete(loc.code);
+        for (const seat of lobby.seats) {
+          if (!seat.socket || seat.socket === socket) continue;
+          seat.socket.data.loc = null;
+          seat.socket.emit(EVENTS.ROOM_UPDATE, { state: 'closed', code: loc.code });
+        }
+      }
+    } else if (loc.type === 'match') {
       const match = this.matches.get(loc.matchId);
       if (match) match.onDisconnect(loc.slot); // keep the match alive for the grace window
     }
@@ -257,11 +367,16 @@ export class RoomManager {
   // ---- drain -------------------------------------------------------------
   drain(reason) {
     this.draining = true;
+    if (this.populationTimer) { clearTimeout(this.populationTimer); this.populationTimer = null; }
     if (this.matchmakeTimer) { clearInterval(this.matchmakeTimer); this.matchmakeTimer = null; }
     for (const e of this.queue) if (e.socket) e.socket.emit(EVENTS.ABORTED, { reason: reason || 'Server restarting' });
     this.queue = [];
     for (const room of this.waitingRooms.values()) if (room.host.socket) room.host.socket.emit(EVENTS.ABORTED, { reason: reason || 'Server restarting' });
     this.waitingRooms.clear();
+    for (const lobby of this.privateLobbies.values()) {
+      for (const seat of lobby.seats) if (seat.socket) seat.socket.emit(EVENTS.ABORTED, { reason: reason || 'Server restarting' });
+    }
+    this.privateLobbies.clear();
     for (const match of [...this.matches.values()]) match.abort(reason);
     this.matches.clear();
   }
@@ -269,6 +384,10 @@ export class RoomManager {
   close() { this.drain('Server closed'); }
 
   stats() {
-    return { rooms: this.waitingRooms.size, queue: this.queue.length, matches: this.matches.size };
+    return {
+      rooms: this.waitingRooms.size + this.privateLobbies.size,
+      queue: this.queue.length,
+      matches: this.matches.size,
+    };
   }
 }

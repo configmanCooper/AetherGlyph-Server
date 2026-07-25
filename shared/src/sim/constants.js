@@ -8,10 +8,10 @@ export const DT = 1 / TICK_HZ;
 // --- Match structure (MASTERPLAN §3) -------------------------------------
 export const MATCH = {
   startHealth: 150,
-  roundLimitS: 105,
-  arcanePressureStartS: 60,
+  roundLimitS: 150,
+  arcanePressureStartS: 90,
   arcanePressureStepS: 10,
-  lateRoundS: 90, // shields -20% cap, healing disabled
+  lateRoundS: 130, // shields -20% cap, healing disabled
 };
 
 // --- Aether (MASTERPLAN §6) ----------------------------------------------
@@ -131,7 +131,7 @@ export const ZONE = {
   radius: 0.55,           // arc half-width a zone covers
   hourglassProjectileSpeedMul: 0.25, // hostile projectiles travel at 25% speed
   frozenSlow: 0.22,       // Frozen Ground slows movement while standing on it
-  coverHp: 26,
+  coverHp: 60,
   snareRootS: 2,
   soakAfterS: 5,
   durations: {

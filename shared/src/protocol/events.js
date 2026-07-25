@@ -8,6 +8,7 @@ export const EVENTS = Object.freeze({
   JOIN_ROOM: 'aeth:joinRoom',       // { code, loadout:[ids], name? }
   QUICK_MATCH: 'aeth:quickMatch',   // { loadout:[ids], name?, rating? }
   CANCEL_QUEUE: 'aeth:cancelQueue', // {}
+  PRIVATE_READY: 'aeth:privateReady', // { loadout:[ids], name? } ready for private rematch
   LEAVE: 'aeth:leave',              // {} leave room / forfeit
   INPUT: 'aeth:input',              // { seq, move, focus, brace, sidestep }
   CAST: 'aeth:cast',                // { seq, points:[{x,y}], strokeBreaks?, durationMs, hint? }
@@ -16,6 +17,7 @@ export const EVENTS = Object.freeze({
 
   // ---- server -> client ------------------------------------------------
   ROOM_UPDATE: 'aeth:roomUpdate',   // waiting-room / queue status
+  POPULATION: 'aeth:population',    // { online } connected clients
   MATCH_START: 'aeth:matchStart',   // { matchId, slot, epoch, token, series, loadouts }
   SNAPSHOT: 'aeth:snapshot',        // { tick, epoch, ackSeq, state, events }
   ROUND_END: 'aeth:roundEnd',       // { winner, reason, score }
@@ -52,4 +54,5 @@ export const ROOM_STATE = Object.freeze({
   WAITING: 'waiting',   // private room created, awaiting opponent
   QUEUED: 'queued',     // in the quick-match queue
   MATCHED: 'matched',   // paired, match starting
+  PRIVATE_LOBBY: 'private-lobby', // persistent private room between matches
 });

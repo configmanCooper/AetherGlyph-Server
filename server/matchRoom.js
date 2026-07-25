@@ -255,6 +255,8 @@ export class MatchRoom {
         winner: this.localWinner(winnerSlot, seat.slot),
         reason,
         score: this.localScore(seat.slot, this.series.score),
+        code: this.code,
+        ranked: this.ranked,
       });
     }
     // Rating persistence is delegated (only ranked/quick-match affects rating).

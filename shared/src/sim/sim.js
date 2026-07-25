@@ -250,6 +250,27 @@ export class Sim {
     return Math.abs(w.arcPos - z.center) <= (z.radius ?? ZONE.radius);
   }
 
+  coverAt(ownerId, arcPos) {
+    return this.zones.find((z) =>
+      z.kind === 'Cover' && z.owner === ownerId && z.ticks > 0 && z.hp > 0
+      && Math.abs(arcPos - z.center) <= z.radius);
+  }
+
+  damageCover(cover, amount, data = {}) {
+    const blocked = Math.max(0, amount);
+    if (!cover || blocked <= 0) return 0;
+    cover.hp -= blocked;
+    const { silent = false, ...eventData } = data;
+    if (!silent) {
+      this.emit('coverBlock', {
+        target: cover.owner, zone: cover.id, center: cover.center, blocked,
+        hp: Math.max(0, cover.hp), ...eventData,
+      });
+    }
+    if (cover.hp <= 0) this.removeZones((z) => z === cover, 'shattered');
+    return blocked;
+  }
+
   addZone(ownerId, kind, opts = {}) {
     const durS = opts.durationS ?? ZONE.durations[kind] ?? 5;
     const owner = this.wizards[ownerId];
@@ -758,7 +779,8 @@ export class Sim {
     total = Math.min(28, total) * quality;
     w.channel = {
       spellId, ticks: totalTicks, totalTicks,
-      perTick: total / Math.max(1, totalTicks), utility: util, staticApplied: false,
+      perTick: total / Math.max(1, totalTicks), utility: util,
+      landedTicks: 0, staticApplied: false,
     };
     this.emit('channelStart', { caster: w.id, utility: util.key });
   }
@@ -767,11 +789,24 @@ export class Sim {
     if (!w.channel) return;
     if (!this.isHardControlled(w)) {
       const opp = this.opponentOf(w.id);
-      this.dealDamage(w, opp, w.channel.perTick, { source: 'Prismatic Beam', school: 'Prismatic', ignoreCap: true });
+      const cover = this.coverAt(opp.id, opp.arcPos);
+      const hitWizard = !cover;
+      if (cover) {
+        const emitImpact = cover.hp <= w.channel.perTick || w.channel.ticks % 6 === 0;
+        this.damageCover(cover, w.channel.perTick, {
+          caster: w.id, spellId: w.channel.spellId, channel: true,
+          silent: !emitImpact,
+        });
+      } else {
+        this.dealDamage(w, opp, w.channel.perTick, {
+          source: 'Prismatic Beam', school: 'Prismatic', ignoreCap: true,
+        });
+        w.channel.landedTicks += 1;
+      }
       const half = w.channel.totalTicks / 2;
       // Tide+Storm utility: apply Static 1 once at least half the beam landed.
-      if (w.channel.utility.applyStatic && !w.channel.staticApplied && w.channel.ticks <= half
-          && !this.hasBarrier(opp)) {
+      if (w.channel.utility.applyStatic && !w.channel.staticApplied && w.channel.landedTicks >= half
+          && hitWizard && !this.hasBarrier(opp)) {
         this.applyStatus(opp, 'Static', w.channel.utility.applyStatic);
         w.channel.staticApplied = true;
       }
@@ -869,13 +904,12 @@ export class Sim {
         break;
       }
       case 'Rubble':
-        this.removeZones((z) => z.kind === 'Cover', 'rubble');
+        // The incoming Quake applies its six-times cover damage on impact. The
+        // reaction marks the interaction without bypassing Stone Wall HP.
         break;
-      case 'FracturedCover': {
-        const cover = this.zones.find((z) => z.kind === 'Cover');
-        if (cover) { cover.hp = Math.max(0, cover.hp - 18); if (cover.hp <= 0) this.removeZones((z) => z === cover, 'fractured'); }
+      case 'FracturedCover':
+        // Fireball applies its triple cover damage on impact.
         break;
-      }
       default: break;
     }
   }
@@ -903,17 +937,21 @@ export class Sim {
       }
       const progress = 1 - Math.max(0, p.ticks) / Math.max(1, p.totalTicks || 1);
       const projectilePos = p.originPos + (p.targetPos - p.originPos) * progress;
-      const cover = this.zones.find((z) =>
-        z.kind === 'Cover' && z.owner === defender.id && z.ticks > 0 && z.hp > 0
-        && Math.abs(projectilePos - z.center) <= z.radius);
-      if (cover && !p.eff.piercing && !p.eff.area && progress >= 0.84) {
-        const blocked = (p.eff.damage || 0) * p.quality;
-        cover.hp -= blocked;
-        this.emit('coverBlock', {
-          target: defender.id, spellId: p.spellId, zone: cover.id,
-          center: cover.center, blocked,
-        });
-        if (cover.hp <= 0) this.removeZones((z) => z === cover, 'shattered');
+      const cover = this.coverAt(defender.id, projectilePos);
+      if (cover && !p.eff.piercing && progress >= 0.84) {
+        const coverIncoming = [];
+        if (p.eff.quake) coverIncoming.push('quake');
+        if (p.eff.destroysCover && p.eff.school === 'Ember') coverIncoming.push('fireball');
+        if (coverIncoming.length) {
+          this.triggerReactions({
+            casterId: p.owner,
+            targetId: defender.id,
+            incoming: coverIncoming,
+            center: cover.center,
+          });
+        }
+        const blocked = (p.eff.damage || 0) * p.quality * (p.eff.coverDamageMul || 1);
+        this.damageCover(cover, blocked, { caster: p.owner, spellId: p.spellId });
         continue;
       }
       if ((defender.barrier || defender.shield) && progress >= 0.9) {
@@ -989,9 +1027,6 @@ export class Sim {
       }
       attacker.countersLanded += 1;
     }
-
-    // Quake / Fireball destroy the defender's cover on impact.
-    if (eff.destroysCover) this.removeZones((z) => z.kind === 'Cover' && z.owner === defender.id, 'destroyed');
 
     // Hit — apply damage.
     const barrierProtected = this.hasBarrier(defender);
