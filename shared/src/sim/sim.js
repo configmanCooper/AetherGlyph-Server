@@ -60,6 +60,7 @@ function makeWizard(id, loadout, spawnArc) {
     lastActivityTick: 0,        // for sigil decay
     snaredZones: new Set(),     // snare zone ids already triggered on this wizard
     wetExposureTicks: 0,        // continuous shared Rain exposure before Soaked
+    veilPulseTicks: 0,          // full active seconds accumulated by Veil Hex
     staminaIdleTicks: 0,        // continuous time stationary for rested regeneration
     movedThisTick: false,
     // rolling counters
@@ -267,8 +268,21 @@ export class Sim {
         hp: Math.max(0, cover.hp), ...eventData,
       });
     }
+
     if (cover.hp <= 0) this.removeZones((z) => z === cover, 'shattered');
     return blocked;
+  }
+
+  zoneSpellMultiplier(school, targetId) {
+    let multiplier = 1;
+    for (const zone of this.zones) {
+      if (zone.ticks <= 0 || zone.damageSchool !== school) continue;
+      multiplier = Math.max(multiplier, Number(zone.damageMul) || 1);
+      if (zone.damageTargetId === targetId) {
+        multiplier = Math.max(multiplier, Number(zone.targetDamageMul) || 1);
+      }
+    }
+    return multiplier;
   }
 
   addZone(ownerId, kind, opts = {}) {
@@ -287,6 +301,12 @@ export class Sim {
       id: this.nextZoneId++, owner: ownerId, kind, center, radius,
       ticks: sToTicks(durS), totalTicks: sToTicks(durS),
       hp: kind === 'Cover' ? ZONE.coverHp : 0,
+      damageSchool: opts.damageSchool || null,
+      damageMul: Number(opts.damageMul) || 1,
+      damageTargetId: Number.isInteger(opts.damageTargetId) ? opts.damageTargetId : null,
+      targetDamageMul: Number(opts.targetDamageMul) || 1,
+      fractured: !!opts.fractured,
+      fractureRadius: Number(opts.fractureRadius) || 0,
     };
     this.zones.push(zone);
     this.emit('zone', {
@@ -308,6 +328,18 @@ export class Sim {
   }
 
   // ----------------------------------------------------------------- statuses
+  stripBuffStatuses(target, cause) {
+    const removed = [];
+    for (const [name, status] of Object.entries(target.statuses)) {
+      if (!status || STATUSES[name]?.kind !== 'buff') continue;
+      delete target.statuses[name];
+      removed.push(name);
+      this.emit('statusEnd', { target: target.id, status: name });
+    }
+    if (removed.length) this.emit('buffsStripped', { target: target.id, cause, statuses: removed });
+    return removed;
+  }
+
   applyStatus(target, name, stacks = 1, opts = {}) {
     const def = STATUSES[name];
     if (!def) return false;
@@ -327,10 +359,18 @@ export class Sim {
       this.emit('grounded', { target: target.id, blocked: 'KnockedDown' });
       return false;
     }
+    if (name === 'Frozen' || name === 'Stunned') {
+      this.stripBuffStatuses(target, name);
+    }
     if (name === 'Wet' && this.hasStatus(target, 'Soaked')) return false;
     if (name === 'Soaked' && target.statuses.Wet) {
       delete target.statuses.Wet;
       this.emit('statusEnd', { target: target.id, status: 'Wet' });
+    }
+    const opposingElement = name === 'Chilled' ? 'Burning' : name === 'Burning' ? 'Chilled' : null;
+    if (opposingElement && target.statuses[opposingElement]) {
+      delete target.statuses[opposingElement];
+      this.emit('statusEnd', { target: target.id, status: opposingElement });
     }
     // Wet or Soaked washes off Burning (water beats fire).
     if ((name === 'Wet' || name === 'Soaked') && target.statuses.Burning) {
@@ -349,11 +389,27 @@ export class Sim {
     } else {
       target.statuses[name] = { stacks: Math.min(maxStacks, stacks), ticks: sToTicks(durS) };
     }
+    if (name === 'Veiled') target.veilPulseTicks = 0;
     this.emit('status', { target: target.id, status: name, stacks: target.statuses[name].stacks });
     return true;
   }
 
   tickStatuses(w) {
+    if (this.hasStatus(w, 'Veiled')) {
+      w.veilPulseTicks += 1;
+      if (w.veilPulseTicks >= TICK_HZ) {
+        w.veilPulseTicks = 0;
+        const affected = [];
+        for (const id of Object.keys(w.cooldowns)) {
+          if (w.cooldowns[id] <= 0) continue;
+          w.cooldowns[id] += TICK_HZ;
+          affected.push(Number(id));
+        }
+        this.emit('veilCooldownTax', { target: w.id, spells: affected });
+      }
+    } else {
+      w.veilPulseTicks = 0;
+    }
     for (const name of Object.keys(w.statuses)) {
       const st = w.statuses[name];
       if (st.ticks <= 0) { delete w.statuses[name]; continue; }
@@ -367,6 +423,7 @@ export class Sim {
       st.ticks -= 1;
       if (st.ticks <= 0) {
         delete w.statuses[name];
+        if (name === 'Veiled') w.veilPulseTicks = 0;
         if (def.hard) {
           // Tenacity engages after hard control ends.
           w.tenacityTicks = sToTicks(CONTROL.tenacityS);
@@ -382,10 +439,26 @@ export class Sim {
     if (rawAmount <= 0 || target.health <= 0) return 0;
     let dmg = rawAmount;
     let markedPayoff = false;
+    let situationalCapMul = 1;
 
     // Attacker Weakened reduces outgoing damage.
     if (attacker && this.hasStatus(attacker, 'Weakened')) {
       dmg *= (1 - STATUSES.Weakened.damageDealt);
+    }
+    if (opts.spellId != null) {
+      const zoneMul = this.zoneSpellMultiplier(opts.school, target.id);
+      let controlMul = 1;
+      if (this.hasStatus(target, 'Frozen') && opts.school !== 'Ember') {
+        controlMul *= REACTION.frozenSpellTakenMul;
+      }
+      if (this.hasStatus(target, 'Stunned')) {
+        controlMul *= REACTION.stunnedSpellTakenMul;
+      }
+      if (this.hasStatus(target, 'KnockedDown')) {
+        controlMul *= REACTION.knockedDownSpellTakenMul;
+      }
+      situationalCapMul = zoneMul * controlMul;
+      dmg *= situationalCapMul;
     }
     // Target Sundered increases incoming direct damage.
     if (!opts.ignoreAmp && this.hasStatus(target, 'Sundered')) {
@@ -437,7 +510,7 @@ export class Sim {
     dmg = Math.max(0, dmg);
     if (dmg <= 0) return 0;
     // No single resolved cast exceeds 30 direct damage (MASTERPLAN §9).
-    if (!opts.ignoreCap) dmg = Math.min(dmg, 30);
+    if (!opts.ignoreCap) dmg = Math.min(dmg, 30 * situationalCapMul);
 
     // Phoenix Covenant: a lethal hit instead leaves the caster at 1 health,
     // once per round, while the aura is up.
@@ -651,11 +724,17 @@ export class Sim {
     }
     if (eff.conditionalControl) {
       const cc = eff.conditionalControl;
-      const met = cc.needs === 'chilled' ? this.hasStatus(opp, 'Chilled') : false;
+      const met = cc.needs === 'chilledOrSoaked'
+        ? this.hasStatus(opp, 'Chilled') || this.hasStatus(opp, 'Soaked')
+        : cc.needs === 'chilled' ? this.hasStatus(opp, 'Chilled') : false;
       if (met) {
-        if (cc.consume && opp.statuses[cc.consume]) {
-          delete opp.statuses[cc.consume];
-          this.emit('statusEnd', { target: opp.id, status: cc.consume });
+        const consumed = Array.isArray(cc.consumeAny)
+          ? cc.consumeAny.find((name) => opp.statuses[name])
+          : cc.consume;
+        if (consumed && opp.statuses[consumed]) {
+          delete opp.statuses[consumed];
+          if (consumed === 'Soaked') opp.wetExposureTicks = 0;
+          this.emit('statusEnd', { target: opp.id, status: consumed });
         }
         this.applyStatus(opp, cc.status, 1, {
           durationS: cc.durationS,
@@ -737,6 +816,7 @@ export class Sim {
           continue;
         }
         if (name === 'Wet') w.wetExposureTicks = 0;
+        if (name === 'Veiled') w.veilPulseTicks = 0;
         delete w.statuses[name];
         this.emit('statusEnd', { target: w.id, status: name });
         this.emit('dispel', { caster: w.id, removed: name });
@@ -799,7 +879,8 @@ export class Sim {
         });
       } else {
         this.dealDamage(w, opp, w.channel.perTick, {
-          source: 'Prismatic Beam', school: 'Prismatic', ignoreCap: true,
+          source: 'Prismatic Beam', spellId: w.channel.spellId,
+          school: 'Prismatic', ignoreCap: true,
         });
         w.channel.landedTicks += 1;
       }
@@ -867,16 +948,32 @@ export class Sim {
         break;
       case 'FrozenGround': {
         const wet = this.zonesOfKind('Wet')[0];
-        if (wet) { wet.kind = 'Frozen'; wet.ticks = sToTicks(REACTION.frozenGroundSlowS); wet.totalTicks = wet.ticks; }
+        if (wet) {
+          wet.kind = 'Frozen';
+          wet.ticks = sToTicks(REACTION.frozenGroundSlowS);
+          wet.totalTicks = wet.ticks;
+          wet.damageSchool = 'Tide';
+          wet.damageMul = REACTION.frozenGroundSpellMul;
+          for (const wizard of this.wizards) this.applyStatus(wizard, 'Chilled', 1);
+        }
         break;
       }
       case 'SteamVeil':
         this.removeZones((z) => z.kind === 'Frozen', 'melted');
         this.addZone(ctx.casterId, 'Fog', { durationS: 9 });
         break;
-      case 'ConductiveArc':
+      case 'ConductiveArc': {
         if (target && !this.hasBarrier(target)) this.applyStatus(target, 'Soaked', 1);
+        const wet = this.zonesOfKind('Wet')[0];
+        if (wet) {
+          wet.damageSchool = 'Storm';
+          wet.damageMul = REACTION.conductiveArcSpellMul;
+        }
+        for (const wizard of this.wizards) {
+          this.applyStatus(wizard, 'Static', STATUSES.Static.maxStacks);
+        }
         break;
+      }
       case 'FlashFire': {
         const oil = this.zonesOfKind('Oil')[0];
         const members = this.wizards.filter((w) => oil && this.wizardInZone(w, oil));
@@ -886,12 +983,23 @@ export class Sim {
           this.dealDamage(this.wizards[ctx.casterId], w, REACTION.flashFireDamage, { source: 'Flash Fire', school: 'Ember' });
           if (!barrierProtected) this.applyStatus(w, 'Burning', 1);
         }
-        this.addZone(ctx.casterId, 'Fire', {});
+        this.addZone(ctx.casterId, 'Fire', {
+          damageSchool: 'Ember',
+          damageMul: REACTION.flashFireSpellMul,
+        });
         break;
       }
       case 'SpreadingFlame': {
         const fire = this.zonesOfKind('Fire')[0];
-        if (fire) { fire.radius = Math.min(1, fire.radius + 0.2); fire.ticks = Math.max(1, Math.round(fire.ticks * 0.6)); }
+        if (fire) {
+          fire.radius = Math.min(1, fire.radius + 0.2);
+          fire.ticks = Math.max(1, Math.round(fire.ticks * 0.6));
+          fire.totalTicks = Math.max(fire.ticks, Math.round(fire.totalTicks * 0.6));
+          fire.damageSchool = 'Ember';
+          fire.damageMul = Math.max(fire.damageMul || 1, REACTION.flashFireSpellMul);
+          fire.damageTargetId = ctx.casterId === 0 ? 1 : 0;
+          fire.targetDamageMul = REACTION.spreadingFlameSpellMul;
+        }
         break;
       }
       case 'ClearedAir':
@@ -907,9 +1015,16 @@ export class Sim {
         // The incoming Quake applies its six-times cover damage on impact. The
         // reaction marks the interaction without bypassing Stone Wall HP.
         break;
-      case 'FracturedCover':
-        // Fireball applies its triple cover damage on impact.
+      case 'FracturedCover': {
+        const cover = this.zones.find((zone) =>
+          zone.kind === 'Cover' && zone.owner === ctx.targetId && zone.ticks > 0
+          && Math.abs(zone.center - ctx.center) <= zone.radius);
+        if (cover) {
+          cover.fractured = true;
+          cover.fractureRadius = REACTION.fracturedCoverRadius;
+        }
         break;
+      }
       default: break;
     }
   }
@@ -950,7 +1065,9 @@ export class Sim {
             center: cover.center,
           });
         }
-        const blocked = (p.eff.damage || 0) * p.quality * (p.eff.coverDamageMul || 1);
+        const blocked = Number.isFinite(p.eff.coverDamage)
+          ? p.eff.coverDamage
+          : (p.eff.damage || 0) * p.quality * (p.eff.coverDamageMul || 1);
         this.damageCover(cover, blocked, { caster: p.owner, spellId: p.spellId });
         continue;
       }
@@ -1035,6 +1152,7 @@ export class Sim {
     const dmg0 = dmgBase * p.quality;
     const dealt = this.dealDamage(attacker, defender, dmg0, {
       source: this.spellData(p.spellId).name,
+      spellId: p.spellId,
       piercing: !!eff.piercing,
       school: eff.school,
     });
@@ -1529,6 +1647,9 @@ export class Sim {
       zones: this.zones.map((z) => ({
         id: z.id, owner: z.owner, kind: z.kind, center: z.center, radius: z.radius,
         ticks: z.ticks, totalTicks: z.totalTicks, hp: z.hp,
+        damageSchool: z.damageSchool, damageMul: z.damageMul,
+        damageTargetId: z.damageTargetId, targetDamageMul: z.targetDamageMul,
+        fractured: z.fractured, fractureRadius: z.fractureRadius,
       })),
       wizards: this.wizards.map((w) => ({
         id: w.id, health: w.health, aether: w.aether, stamina: w.stamina, charges: w.charges,
@@ -1546,6 +1667,7 @@ export class Sim {
         evadeTicks: w.evadeTicks, invisibleTicks: w.invisibleTicks, mirrorTicks: w.mirrorTicks,
         mirrorPos: w.mirrorPos, mirrorDir: w.mirrorDir,
         wetExposureTicks: w.wetExposureTicks,
+        veilPulseTicks: w.veilPulseTicks,
         staminaIdleTicks: w.staminaIdleTicks,
         sidestepCharges: w.sidestepCharges, recoveryTicks: w.recoveryTicks,
         statuses: Object.fromEntries(Object.entries(w.statuses).map(([k, v]) => [k, { stacks: v.stacks, ticks: v.ticks }])),
@@ -1581,6 +1703,7 @@ export class Sim {
         w.deflectTicks, w.evadeTicks, w.invisibleTicks, w.mirrorTicks,
         q(w.mirrorPos, 1000), w.mirrorDir,
         w.wetExposureTicks, w.staminaIdleTicks,
+        w.veilPulseTicks,
         w.shield ? q(w.shield.absorb, 100) : 0, w.shield ? w.shield.ticks : 0,
         w.barrier ? q(w.barrier.absorb, 100) : 0, w.barrier ? w.barrier.ticks : 0,
         w.sidestepCharges, w.recoveryTicks, w.lastActivityTick, w.phoenixUsed ? 1 : 0,
@@ -1605,7 +1728,10 @@ export class Sim {
     }
     for (const z of this.zones.slice().sort((a, b) => a.id - b.id)) {
       parts.push('z', z.id, z.owner, z.kind, z.ticks, z.totalTicks,
-        q(z.center, 1000), q(z.radius, 1000), q(z.hp || 0, 100));
+        q(z.center, 1000), q(z.radius, 1000), q(z.hp || 0, 100),
+        z.damageSchool || '', q(z.damageMul || 1, 100),
+        z.damageTargetId ?? -1, q(z.targetDamageMul || 1, 100),
+        z.fractured ? 1 : 0, q(z.fractureRadius || 0, 1000));
     }
     const str = parts.join('|');
     let h = 2166136261 >>> 0;

@@ -99,7 +99,13 @@ export function remapSnapshotForSlot(snap, slot) {
     out.projectiles = snap.projectiles.map((p) => ({ ...p, owner: flip(p.owner) }));
   }
   if (Array.isArray(snap.zones)) {
-    out.zones = snap.zones.map((z) => ({ ...z, owner: flip(z.owner) }));
+    out.zones = snap.zones.map((z) => ({
+      ...z,
+      owner: flip(z.owner),
+      damageTargetId: z.damageTargetId === 0 || z.damageTargetId === 1
+        ? flip(z.damageTargetId)
+        : z.damageTargetId,
+    }));
   }
   return out;
 }

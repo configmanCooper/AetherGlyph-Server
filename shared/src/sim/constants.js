@@ -136,7 +136,7 @@ export const ZONE = {
   soakAfterS: 5,
   durations: {
     Oil: 21, Wet: 21, Fog: 18, Frozen: 9, Snare: 24, Cover: 24,
-    Hourglass: 18, Fire: 12, Gust: 1.8, Grounded: 3,
+    Hourglass: 18, Fire: 12, Gust: 6, Grounded: 3,
   },
 };
 
@@ -150,6 +150,14 @@ export const REACTION = {
   cooldownS: 1.0,          // same reaction cannot trigger more than once/sec
   maxLinks: 2,             // chains stop after two reaction links
   flashFireDamage: 10,     // Oil + Ember -> Flash Fire area damage
+  flashFireSpellMul: 1.25,
+  spreadingFlameSpellMul: 1.5,
+  frozenGroundSpellMul: 1.25,
+  conductiveArcSpellMul: 1.25,
+  frozenSpellTakenMul: 1.25,
+  stunnedSpellTakenMul: 1.25,
+  knockedDownSpellTakenMul: 1.10,
+  fracturedCoverRadius: 0.34,
   quakeSlowS: 3.0,         // Wall + Quake rubble slow
   frozenGroundSlowS: 9,    // Wet + Frost -> Frozen Ground slow surface
 };

@@ -76,10 +76,10 @@ export const SPELL_EFFECTS = {
     conductReaction: true,
     conditionalStun: { needs: 'soakedOrStatic2', staticStacks: 2, durationS: 0.8, grantsTenacity: true },
   },
-  8: { // Fireball — heavy area, devastating against cover
+  8: { // Fireball — heavy area, fractures cover
     type: PROJECTILE, damage: 30, status: { name: 'Burning', stacks: 1 }, charges: 1,
     travelS: 0.55, homing: 0, dodgeRadius: 0.55, area: true, school: 'Ember', reflectable: false,
-    destroysCover: true, coverDamageMul: 3, igniteOil: true,
+    destroysCover: true, coverDamage: 30, igniteOil: true,
   },
   9: { // Ice Comet — heavy area
     type: PROJECTILE, damage: 26, status: { name: 'Chilled', stacks: 1 }, charges: 1,
@@ -111,9 +111,9 @@ export const SPELL_EFFECTS = {
 
   // === Control (5) =========================================================
   26: { type: HEX, status: { name: 'Rooted', stacks: 1 }, school: 'Stone' }, // Entangle
-  27: { // Frost Bind — freeze only if Chilled; consumes Chilled, grants Tenacity
-    type: HEX, conditionalControl: { needs: 'chilled', status: 'Frozen', durationS: 3,
-      consume: 'Chilled', grantsTenacity: true, ignoreHardCap: true }, school: 'Tide',
+  27: { // Frost Bind — freeze Chilled or Soaked; consumes the setup, grants Tenacity
+    type: HEX, conditionalControl: { needs: 'chilledOrSoaked', status: 'Frozen', durationS: 3,
+      consumeAny: ['Chilled', 'Soaked'], grantsTenacity: true, ignoreHardCap: true }, school: 'Tide',
   },
   28: { // Concussive Blast
     type: PROJECTILE, damage: 6, knockback: true, knockdown: true, interrupt: true, status: null,
@@ -132,7 +132,7 @@ export const SPELL_EFFECTS = {
   // === Environmental (6) ===================================================
   31: { type: ZONE, zoneKind: 'Oil', school: 'Ember' }, // Oil Script
   32: { type: ZONE, zoneKind: 'Wet', dousesBurning: true, school: 'Tide' }, // Rain Glyph
-  33: { type: ZONE, zoneKind: 'Gust', deflect: true, deflectWindowS: 1.2, movesZones: true, knockdown: true, school: 'Gale' }, // Gust Wall
+  33: { type: ZONE, zoneKind: 'Gust', deflect: true, deflectWindowS: 5.5, movesZones: true, knockdown: true, school: 'Gale' }, // Gust Wall
   34: { // Quake — area damage + interrupt + devastating cover damage
     type: PROJECTILE, damage: 10, interrupt: true, knockdown: true, destroysCover: true, status: null, charges: 1,
     travelS: 0.2, homing: 0, dodgeRadius: 0.5, area: true, school: 'Stone', reflectable: false,
