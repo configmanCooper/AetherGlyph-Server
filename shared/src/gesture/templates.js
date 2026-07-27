@@ -84,6 +84,18 @@ function risingCoil(cx, yBot, yTop, r, turns, steps = 26) {
   return pts;
 }
 
+function horizontalWave(x0, x1, cy, amplitude, cycles, steps = 36) {
+  const pts = [];
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    pts.push({
+      x: x0 + (x1 - x0) * t,
+      y: cy - amplitude * Math.sin(t * cycles * Math.PI * 2),
+    });
+  }
+  return pts;
+}
+
 // Raw canonical single-stroke paths, keyed by gestureKey (see GESTURE_KEYS).
 export const GESTURE_TEMPLATES = {
   // === Starter set (kept identical to Phase 1/2 so tutorials + smoke hold) ==
@@ -219,16 +231,19 @@ export const GESTURE_TEMPLATES = {
       return out;
     })(),
   ],
-  twinLines: [ // 30 Thunderclap — two inward-leaning vertical lines
-    [{ x: 28, y: 16 }, { x: 40, y: 84 }, { x: 72, y: 16 }, { x: 60, y: 84 }],
-    [{ x: 24, y: 12 }, { x: 38, y: 88 }, { x: 76, y: 12 }, { x: 62, y: 88 }],
-    [{ x: 32, y: 18 }, { x: 42, y: 82 }, { x: 68, y: 14 }, { x: 58, y: 86 }],
+  twinLines: [ // 30 Thunderclap — two stacked Blink-like Z strokes
+    [{ x: 15, y: 14 }, { x: 78, y: 14 }, { x: 14, y: 45 },
+     { x: 82, y: 45 }, { x: 24, y: 80 }, { x: 94, y: 82 }],
+    [{ x: 12, y: 18 }, { x: 74, y: 16 }, { x: 18, y: 47 },
+     { x: 86, y: 47 }, { x: 28, y: 78 }, { x: 92, y: 84 }],
+    [{ x: 18, y: 12 }, { x: 82, y: 14 }, { x: 16, y: 43 },
+     { x: 78, y: 46 }, { x: 22, y: 76 }, { x: 90, y: 80 }],
   ],
 
   // === Environmental ======================================================
-  wavyLine: [ // 31 Oil Script — rounded wave, tall enough to differ from a flick
-    [{ x: 8, y: 50 }, { x: 19, y: 33 }, { x: 31, y: 66 }, { x: 44, y: 34 },
-     { x: 57, y: 66 }, { x: 69, y: 34 }, { x: 81, y: 66 }, { x: 92, y: 50 }],
+  wavyLine: [ // 31 Oil Script — smooth horizontal three-hump wave
+    horizontalWave(8, 92, 52, 23, 3, 36),
+    horizontalWave(10, 90, 50, 20, 3, 30),
   ],
   cloudArc: [ // 32 Rain Glyph — bumpy cloud top then a downward rain stroke
     [{ x: 18, y: 46 }, { x: 26, y: 32 }, { x: 40, y: 34 }, { x: 50, y: 26 },
@@ -274,6 +289,7 @@ export const GESTURE_TEMPLATES = {
 // Blink begins horizontally, and Quake begins vertically.
 export const GESTURE_TRAITS = {
   doubleStroke: { startAxis: 'horizontal' },
+  twinLines: { startAxis: 'horizontal' },
   quakeSlash: { startAxis: 'vertical' },
 };
 
