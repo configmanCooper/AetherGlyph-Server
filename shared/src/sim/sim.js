@@ -665,6 +665,10 @@ export class Sim {
           originPos: w.arcPos,
           targetPos: c.targetPos ?? w.facing,
         });
+        if (eff.selfKnockdown) {
+          this.applyStatus(w, 'KnockedDown', 1);
+          this.emit('spellBacklash', { caster: w.id, spellId: c.spellId, status: 'KnockedDown' });
+        }
         break;
       }
       case SHIELD: {

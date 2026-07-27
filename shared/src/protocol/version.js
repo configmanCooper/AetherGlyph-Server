@@ -4,7 +4,7 @@
 import { SPELLS_SOURCE_CHECKSUM } from '../balance/spellData.generated.js';
 
 export const PROTOCOL_VERSION = 3;
-export const BALANCE_VERSION = 28;
+export const BALANCE_VERSION = 29;
 export const APP_PHASE = 5;
 export const APP_VERSION = '1.11.0';
 

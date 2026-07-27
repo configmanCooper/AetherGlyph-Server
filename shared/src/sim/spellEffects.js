@@ -74,7 +74,7 @@ export const SPELL_EFFECTS = {
     type: PROJECTILE, damage: 18, status: null, charges: 1,
     travelS: 0.4, homing: 0.1, dodgeRadius: 0.3, school: 'Storm', reflectable: false,
     conductReaction: true,
-    conditionalStun: { needs: 'soakedOrStatic2', staticStacks: 2, durationS: 0.8, grantsTenacity: true },
+    conditionalStun: { needs: 'soakedOrStatic2', staticStacks: 2, durationS: 2, grantsTenacity: true },
   },
   8: { // Fireball — heavy area, fractures cover
     type: PROJECTILE, damage: 30, status: { name: 'Burning', stacks: 1 }, charges: 1,
@@ -112,7 +112,7 @@ export const SPELL_EFFECTS = {
   // === Control (5) =========================================================
   26: { type: HEX, status: { name: 'Rooted', stacks: 1 }, school: 'Stone' }, // Entangle
   27: { // Frost Bind — freeze Chilled or Soaked; consumes the setup, grants Tenacity
-    type: HEX, conditionalControl: { needs: 'chilledOrSoaked', status: 'Frozen', durationS: 3,
+    type: HEX, conditionalControl: { needs: 'chilledOrSoaked', status: 'Frozen', durationS: 4,
       consumeAny: ['Chilled', 'Soaked'], grantsTenacity: true, ignoreHardCap: true }, school: 'Tide',
   },
   28: { // Concussive Blast
@@ -121,10 +121,10 @@ export const SPELL_EFFECTS = {
   },
   29: { type: HEX, status: { name: 'Blinded', stacks: 1 }, school: 'Umbra' }, // Eclipse Glare
   30: { // Thunderclap — damage + conditional stun
-    type: PROJECTILE, damage: 8, status: null, charges: 1,
+    type: PROJECTILE, damage: 8, status: null, charges: 1, selfKnockdown: true,
     travelS: 0.25, homing: 0, dodgeRadius: 0.32, school: 'Storm', reflectable: false,
     conditionalStun: {
-      needs: 'soakedOrStatic2', staticStacks: 2, durationS: 2, grantsTenacity: true,
+      needs: 'soakedOrStatic2', staticStacks: 2, durationS: 4, grantsTenacity: true,
       consumeStatic: true, ignoreHardCap: true,
     },
   },
