@@ -11,6 +11,7 @@ export const EVENTS = Object.freeze({
   CANCEL_QUEUE: 'aeth:cancelQueue', // {}
   PRIVATE_READY: 'aeth:privateReady', // { loadout:[ids], name? } ready for private duel/rematch
   PRIVATE_UNREADY: 'aeth:privateUnready', // {} leave ready state before editing
+  RANKINGS_REQUEST: 'aeth:rankingsRequest', // {} -> ack { top, self, season }
   LEAVE: 'aeth:leave',              // {} leave room / forfeit
   INPUT: 'aeth:input',              // { seq, move, focus, brace, sidestep }
   CAST: 'aeth:cast',                // { seq, points:[{x,y}], strokeBreaks?, durationMs, hint? }
@@ -26,6 +27,7 @@ export const EVENTS = Object.freeze({
   MATCH_END: 'aeth:matchEnd',       // { winner, reason, score }
   OPPONENT_STATUS: 'aeth:opponentStatus', // { state:'disconnected'|'returned', graceMs? }
   RESUME_TOKEN: 'aeth:resumeToken', // { token } rotated single-use token
+  RANKING_UPDATE: 'aeth:rankingUpdate', // personalized Glyph result after ranked match
   ABORTED: 'aeth:aborted',          // { reason } drain / fatal
   PONG: 'aeth:pong',                // { t } echo of ping
 });

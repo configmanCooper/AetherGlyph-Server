@@ -2,7 +2,7 @@
 
 This is a separate, asset-free deployment package for Aetherglyph online play.
 It contains only the deterministic simulation, gesture recognizer, matchmaking,
-private rooms, reconnect/resume handling, and optional rating persistence.
+private rooms, reconnect/resume handling, and PostgreSQL-backed Glyph rankings.
 
 It does **not** include or serve the game client, Three.js, graphics, music, or
 screenshots. Android, Windows, and web clients carry their own assets and connect
@@ -21,7 +21,7 @@ directly through Socket.IO. It serves only two small required legal HTML pages:
    the recommended starting point for up to roughly 500 concurrent players.
 
 The health endpoint reports connections, active matches, memory, event-loop lag,
-snapshot rate, and rating-store type:
+snapshot rate, and ranking-store type:
 
 ```text
 GET /healthz

@@ -1,7 +1,7 @@
 // roomManager.js — owns room/match lifecycle for the authoritative service.
 //
 // Responsibilities: private rooms (create/join by short code), a quick-match
-// queue with a widening rating band, anonymous stable identity, per-socket
+// queue with Glyph-range matching, anonymous stable identity, per-socket
 // control rate limiting, disconnect routing, single-use resume-token routing,
 // and graceful drain. Each live match is owned by exactly one MatchRoom.
 
@@ -22,10 +22,6 @@ function sanitizeAccountId(value) {
 }
 
 // Rating band widens with wait time so a match is always eventually found.
-function bandFor(waitMs) {
-  return 80 + Math.floor(Math.max(0, waitMs) / 1000) * 50;
-}
-
 export class RoomManager {
   constructor(io, opts = {}) {
     this.io = io;
@@ -35,8 +31,10 @@ export class RoomManager {
     this.graceMs = opts.graceMs;
     this.intermissionMs = opts.intermissionMs;
     this.privateLobbyGraceMs = opts.privateLobbyGraceMs ?? 2 * 60 * 1000;
+    this.rankedRange = opts.rankedRange ?? 50;
+    this.rankedRangeWaitMs = opts.rankedRangeWaitMs ?? 3000;
     this.privateLobbies = new Map(); // code -> { code, seats, ready }
-    this.queue = [];               // { socket, accountId, name, loadoutIds, rating, since }
+    this.queue = [];               // { socket, accountId, name, loadoutIds, glyphs, ranked, since }
     this.matches = new Map();      // matchId -> MatchRoom
     this.draining = false;
     this.populationTimer = null;
@@ -66,6 +64,20 @@ export class RoomManager {
     socket.on(EVENTS.PRIVATE_UNREADY, (p, ack) => {
       if (!socket.data.auxiliary.take()) { this.ack(ack, { ok: false, code: ERR.RATE }); return; }
       this.privateUnready(socket, ack);
+    });
+    socket.on(EVENTS.RANKINGS_REQUEST, async (p, ack) => {
+      if (!socket.data.auxiliary.take()) { this.ack(ack, { ok: false, code: ERR.RATE }); return; }
+      try {
+        const rankings = await this.ratingStore.getLeaderboard(
+          socket.data.accountId,
+          socket.data.name,
+          10,
+        );
+        this.ack(ack, { ok: true, ...rankings });
+      } catch (error) {
+        this.log('rankings request failed', error?.message);
+        this.ack(ack, { ok: false, code: ERR.BAD_STATE });
+      }
     });
     socket.on(EVENTS.LEAVE, (p, ack) => {
       if (!socket.data.auxiliary.take()) { this.ack(ack, { ok: false, code: ERR.RATE }); return; }
@@ -190,17 +202,21 @@ export class RoomManager {
     if (!v.valid) { this.ack(ack, { ok: false, code: ERR.INVALID_LOADOUT, errors: v.errors }); return; }
     if (payload.name) socket.data.name = sanitizeName(payload.name, socket.data.name);
     const ranked = payload.ranked !== false;
-    let rating = 1000;
-    try { rating = await this.ratingStore.getRating(socket.data.accountId); } catch { /* default */ }
+    let glyphs = 100;
+    if (ranked) {
+      try {
+        glyphs = await this.ratingStore.getGlyphs(socket.data.accountId, socket.data.name);
+      } catch { /* default */ }
+    }
     if (socket.data.loc || this.draining || !socket.connected) return; // state changed while awaiting
     const entry = {
       socket, accountId: socket.data.accountId, name: socket.data.name,
-      loadoutIds: ids, rating, ranked, since: Date.now(),
+      loadoutIds: ids, glyphs, ranked, since: Date.now(),
     };
     this.queue.push(entry);
     socket.data.loc = { type: 'queue' };
-    this.ack(ack, { ok: true, state: ROOM_STATE.QUEUED, rating, ranked });
-    socket.emit(EVENTS.ROOM_UPDATE, { state: ROOM_STATE.QUEUED, ranked });
+    this.ack(ack, { ok: true, state: ROOM_STATE.QUEUED, glyphs, ranked });
+    socket.emit(EVENTS.ROOM_UPDATE, { state: ROOM_STATE.QUEUED, glyphs, ranked });
     this.matchmake();
   }
 
@@ -223,12 +239,14 @@ export class RoomManager {
       for (let j = 0; j < q.length; j++) {
         if (i === j || used.has(q[j]) || !q[j].socket.connected
             || q[j].ranked !== q[i].ranked) continue;
-        const diff = Math.abs(q[i].rating - q[j].rating);
+        if (q[i].accountId && q[j].accountId && q[i].accountId === q[j].accountId) continue;
+        const diff = Math.abs(q[i].glyphs - q[j].glyphs);
         if (diff < bestDiff) { bestDiff = diff; best = q[j]; }
       }
       if (!best) continue;
-      const allowed = Math.max(bandFor(now - q[i].since), bandFor(now - best.since));
-      if (bestDiff <= allowed) {
+      const waitedLongEnough = now - q[i].since >= this.rankedRangeWaitMs;
+      const eligible = !q[i].ranked || bestDiff <= this.rankedRange || waitedLongEnough;
+      if (eligible) {
         used.add(q[i]);
         used.add(best);
         this.startMatch([q[i], best], { ranked: q[i].ranked });
@@ -387,14 +405,22 @@ export class RoomManager {
 
   async persistResult(result) {
     if (!this.ratingStore) return;
+    if (!result.ranked) return { ranked: false, applied: false };
     try {
-      await this.ratingStore.recordResult({
+      return await this.ratingStore.recordResult({
         matchId: result.matchId,
         ranked: result.ranked,
         winnerSlot: result.winnerSlot,
-        players: result.players.map((p) => ({ accountId: p.accountId })),
+        reason: result.reason,
+        players: result.players.map((p) => ({
+          accountId: p.accountId,
+          name: p.name,
+        })),
       });
-    } catch (err) { this.log('rating persist failed', err && err.message); }
+    } catch (err) {
+      this.log('Glyph ranking persist failed', err && err.message);
+      throw err;
+    }
   }
 
   // ---- in-match routing --------------------------------------------------

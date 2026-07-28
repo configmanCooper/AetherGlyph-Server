@@ -64,6 +64,7 @@ export class MatchRoom {
         slot,
         accountId: s.accountId,
         name: s.name || `Wizard ${slot + 1}`,
+        glyphs: Number.isFinite(s.glyphs) ? s.glyphs : 100,
         loadoutIds: s.loadoutIds.slice(),
         loadout,
         recognizer: BASE_RECOGNIZER,
@@ -119,6 +120,7 @@ export class MatchRoom {
       // Local order: self first, opponent second (client always renders as p0).
       loadouts: [seat.loadoutIds, opp.loadoutIds],
       names: [seat.name, opp.name],
+      glyphs: [seat.glyphs, opp.glyphs],
     });
   }
 
@@ -259,14 +261,48 @@ export class MatchRoom {
         ranked: this.ranked,
       });
     }
-    // Rating persistence is delegated (only ranked/quick-match affects rating).
+    // Glyph persistence is delegated. The match closes immediately; the
+    // personalized ranking update follows when the atomic transaction commits.
     try {
-      this.onResult({
+      Promise.resolve(this.onResult({
         matchId: this.matchId,
         ranked: this.ranked,
         winnerSlot,
         reason,
         players: this.seats.map((s) => ({ accountId: s.accountId, name: s.name })),
+      })).then((ranking) => {
+        if (!ranking?.ranked || !Array.isArray(ranking.players)) return;
+        this.seats.forEach((seat, slot) => {
+          if (!seat.socket) return;
+          const self = ranking.players[slot];
+          const opponent = ranking.players[this.otherSlot(slot)];
+          seat.socket.emit(EVENTS.RANKING_UPDATE, {
+            ok: true,
+            matchId: this.matchId,
+            season: ranking.season,
+            transfer: ranking.transfer,
+            glyphsBefore: self.glyphsBefore,
+            glyphsAfter: self.glyphsAfter,
+            delta: self.delta,
+            rank: self.rank,
+            wins: self.wins,
+            losses: self.losses,
+            draws: self.draws,
+            opponentGlyphsBefore: opponent.glyphsBefore,
+            opponentGlyphsAfter: opponent.glyphsAfter,
+          });
+        });
+      }).catch((error) => {
+        this.log('onResult error', error?.message);
+        for (const seat of this.seats) {
+          if (seat.socket) {
+            seat.socket.emit(EVENTS.RANKING_UPDATE, {
+              ok: false,
+              matchId: this.matchId,
+              code: 'persistence-failed',
+            });
+          }
+        }
       });
     } catch (err) { this.log('onResult error', err && err.message); }
     this.stop('match-complete');
