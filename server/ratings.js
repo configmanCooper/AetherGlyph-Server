@@ -1064,9 +1064,15 @@ export async function createRatingStore(opts = {}) {
     try {
       const pg = await import('pg');
       const Pool = pg.default?.Pool || pg.Pool;
-      const ssl = /localhost|127\.0\.0\.1/.test(url)
-        ? false
-        : { rejectUnauthorized: process.env.PGSSL_REJECT_UNAUTHORIZED !== 'false' };
+      const hostname = new URL(url).hostname;
+      const local = /^(?:localhost|127\.0\.0\.1)$/.test(hostname);
+      const renderInternal = process.env.RENDER === 'true'
+        || hostname.endsWith('.render.com')
+        || !hostname.includes('.');
+      const rejectUnauthorized = process.env.PGSSL_REJECT_UNAUTHORIZED == null
+        ? !renderInternal
+        : process.env.PGSSL_REJECT_UNAUTHORIZED !== 'false';
+      const ssl = local ? false : { rejectUnauthorized };
       pool = new Pool({ connectionString: url, ssl, max: opts.max || 4 });
       const store = new PostgresRatingStore(pool);
       await store.init();
