@@ -21,6 +21,10 @@ function sanitizeAccountId(value) {
   return s || null;
 }
 
+function authKey(value) {
+  return String(value || '').trim().toLowerCase().slice(0, 24) || '-';
+}
+
 // Rating band widens with wait time so a match is always eventually found.
 export class RoomManager {
   constructor(io, opts = {}) {
@@ -33,9 +37,12 @@ export class RoomManager {
     this.privateLobbyGraceMs = opts.privateLobbyGraceMs ?? 2 * 60 * 1000;
     this.rankedRange = opts.rankedRange ?? 50;
     this.rankedRangeWaitMs = opts.rankedRangeWaitMs ?? 3000;
+    this.requireAccounts = opts.requireAccounts !== false;
     this.privateLobbies = new Map(); // code -> { code, seats, ready }
     this.queue = [];               // { socket, accountId, name, loadoutIds, glyphs, ranked, since }
     this.matches = new Map();      // matchId -> MatchRoom
+    this.authIpBuckets = new Map();
+    this.authNameBuckets = new Map();
     this.draining = false;
     this.populationTimer = null;
     this.matchmakeTimer = setInterval(() => this.matchmake(), 1000);
@@ -43,13 +50,66 @@ export class RoomManager {
   }
 
   // ---- socket wiring -----------------------------------------------------
+  authBucket(map, key, rate, burst) {
+    let bucket = map.get(key);
+    if (!bucket) {
+      bucket = new TokenBucket(rate, burst);
+      map.set(key, bucket);
+    }
+    return bucket;
+  }
+
+  allowAccountAttempt(socket, username) {
+    const ip = socket.handshake.address || 'unknown';
+    return this.authBucket(this.authIpBuckets, ip, 0.5, 10).take()
+      && this.authBucket(this.authNameBuckets, authKey(username), 0.2, 5).take();
+  }
+
   register(socket) {
-    socket.data.accountId = sanitizeAccountId(socket.handshake.auth && socket.handshake.auth.clientId) || `anon-${randomId(6)}`;
-    socket.data.name = sanitizeName(socket.handshake.auth && socket.handshake.auth.name, `Wizard-${socket.data.accountId.slice(-4)}`);
+    const verified = socket.data.verifiedAccount;
+    socket.data.accountId = verified?.accountId
+      || sanitizeAccountId(socket.handshake.auth && socket.handshake.auth.clientId)
+      || `anon-${randomId(6)}`;
+    socket.data.name = verified?.name
+      || sanitizeName(socket.handshake.auth && socket.handshake.auth.name, `Wizard-${socket.data.accountId.slice(-4)}`);
+    socket.data.authenticated = !!verified || !this.requireAccounts;
     socket.data.control = new TokenBucket(5, 8); // create/join/quick spam guard
     socket.data.auxiliary = new TokenBucket(10, 20); // ping/resume/ready/leave flood guard
+    socket.data.authLimiter = new TokenBucket(1, 4);
     socket.data.loc = null;
 
+    socket.on(EVENTS.ACCOUNT_STATUS, (p, ack) => {
+      this.ack(ack, {
+        ok: true,
+        authenticated: socket.data.authenticated,
+        accountId: socket.data.authenticated ? socket.data.accountId : null,
+        name: socket.data.authenticated ? socket.data.name : null,
+      });
+    });
+    socket.on(EVENTS.ACCOUNT_AUTH, async (p, ack) => {
+      if (!socket.data.authLimiter.take() || !this.allowAccountAttempt(socket, p?.username)) {
+        this.ack(ack, { ok: false, code: ERR.RATE });
+        return;
+      }
+      if (socket.data.loc) {
+        this.ack(ack, { ok: false, code: ERR.IN_MATCH });
+        return;
+      }
+      try {
+        const result = await this.ratingStore.authenticateTemporary(p?.username, p?.pin);
+        if (!result.ok) {
+          this.ack(ack, result);
+          return;
+        }
+        socket.data.accountId = result.accountId;
+        socket.data.name = result.name;
+        socket.data.authenticated = true;
+        this.ack(ack, result);
+      } catch (error) {
+        this.log('temporary account authentication failed', error?.message);
+        this.ack(ack, { ok: false, code: ERR.BAD_STATE });
+      }
+    });
     socket.on(EVENTS.CREATE_ROOM, (p, ack) => this.createRoom(socket, p || {}, ack));
     socket.on(EVENTS.JOIN_ROOM, (p, ack) => this.joinRoom(socket, p || {}, ack));
     socket.on(EVENTS.QUICK_MATCH, (p, ack) => this.quickMatch(socket, p || {}, ack));
@@ -67,11 +127,15 @@ export class RoomManager {
     });
     socket.on(EVENTS.RANKINGS_REQUEST, async (p, ack) => {
       if (!socket.data.auxiliary.take()) { this.ack(ack, { ok: false, code: ERR.RATE }); return; }
+      if (this.requireAccounts && !socket.data.authenticated) {
+        this.ack(ack, { ok: false, code: ERR.AUTH_REQUIRED });
+        return;
+      }
       try {
         const rankings = await this.ratingStore.getLeaderboard(
           socket.data.accountId,
           socket.data.name,
-          10,
+          100,
         );
         this.ack(ack, { ok: true, ...rankings });
       } catch (error) {
@@ -104,6 +168,10 @@ export class RoomManager {
 
   guard(socket, ack) {
     if (this.draining) { this.ack(ack, { ok: false, code: ERR.DRAINING }); return false; }
+    if (this.requireAccounts && !socket.data.authenticated) {
+      this.ack(ack, { ok: false, code: ERR.AUTH_REQUIRED });
+      return false;
+    }
     if (!socket.data.control.take()) { this.ack(ack, { ok: false, code: ERR.RATE }); return false; }
     if (socket.data.loc) { this.ack(ack, { ok: false, code: ERR.IN_MATCH }); return false; }
     return true;
@@ -132,7 +200,7 @@ export class RoomManager {
     const ids = Array.isArray(payload.loadout) ? payload.loadout.map(Number) : null;
     const v = validateSeatLoadout(ids);
     if (!v.valid) { this.ack(ack, { ok: false, code: ERR.INVALID_LOADOUT, errors: v.errors }); return; }
-    if (payload.name) socket.data.name = sanitizeName(payload.name, socket.data.name);
+    if (!this.requireAccounts && payload.name) socket.data.name = sanitizeName(payload.name, socket.data.name);
 
     let code = roomCode(NET.ROOM_CODE_LEN);
     while (this.privateLobbies.has(code)) code = roomCode(NET.ROOM_CODE_LEN);
@@ -157,7 +225,7 @@ export class RoomManager {
     const ids = Array.isArray(payload.loadout) ? payload.loadout.map(Number) : null;
     const v = validateSeatLoadout(ids);
     if (!v.valid) { this.ack(ack, { ok: false, code: ERR.INVALID_LOADOUT, errors: v.errors }); return; }
-    if (payload.name) socket.data.name = sanitizeName(payload.name, socket.data.name);
+    if (!this.requireAccounts && payload.name) socket.data.name = sanitizeName(payload.name, socket.data.name);
     const existingSlot = lobby.seats.findIndex((seat) => seat.accountId === socket.data.accountId);
     if (existingSlot >= 0) {
       const seat = lobby.seats[existingSlot];
@@ -200,7 +268,7 @@ export class RoomManager {
     const ids = Array.isArray(payload.loadout) ? payload.loadout.map(Number) : null;
     const v = validateSeatLoadout(ids);
     if (!v.valid) { this.ack(ack, { ok: false, code: ERR.INVALID_LOADOUT, errors: v.errors }); return; }
-    if (payload.name) socket.data.name = sanitizeName(payload.name, socket.data.name);
+    if (!this.requireAccounts && payload.name) socket.data.name = sanitizeName(payload.name, socket.data.name);
     const ranked = payload.ranked !== false;
     let glyphs = 100;
     if (ranked) {
@@ -332,7 +400,7 @@ export class RoomManager {
     }
     const seat = lobby.seats[loc.slot];
     seat.loadoutIds = ids;
-    if (payload.name) {
+    if (!this.requireAccounts && payload.name) {
       socket.data.name = sanitizeName(payload.name, socket.data.name);
       seat.name = socket.data.name;
     }
@@ -462,6 +530,10 @@ export class RoomManager {
   // ---- reconnect / resume ------------------------------------------------
   resume(socket, payload, ack) {
     if (this.draining) { this.ack(ack, { ok: false, code: ERR.DRAINING }); return; }
+    if (this.requireAccounts && !socket.data.authenticated) {
+      this.ack(ack, { ok: false, code: ERR.AUTH_REQUIRED });
+      return;
+    }
     const token = verifyToken(this.secret, payload && payload.token);
     if (!token) { this.ack(ack, { ok: false, code: ERR.BAD_TOKEN }); return; }
     const match = this.matches.get(token.matchId);

@@ -3,11 +3,13 @@ import { createGameServer } from '../server.js';
 const server = createGameServer({
   ratingStore: {
     kind: 'test',
-    getRating: async () => 1000,
+    getGlyphs: async () => 100,
+    getLeaderboard: async () => ({ season: 'test', top: [], self: null }),
     recordResult: async () => {},
     close: async () => {},
   },
   secret: 'smoke-secret',
+  requireAccounts: false,
 });
 
 try {

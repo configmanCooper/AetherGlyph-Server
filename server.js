@@ -106,7 +106,7 @@ export function createGameServer(opts = {}) {
     });
   });
 
-  io.use((socket, next) => {
+  io.use(async (socket, next) => {
     if (io.engine.clientsCount > maxConnections) {
       const error = new Error('Server full');
       error.data = { code: 'capacity' };
@@ -132,7 +132,15 @@ export function createGameServer(opts = {}) {
     }
     connectionsByIp.set(ip, count + 1);
     socket.data.capacityIp = ip;
-    next();
+    try {
+      if (auth.accountToken && ratingStore) {
+        socket.data.verifiedAccount = await ratingStore.resolveTemporarySession(auth.accountToken);
+      }
+      next();
+    } catch (error) {
+      connectionsByIp.set(ip, Math.max(0, (connectionsByIp.get(ip) || 1) - 1));
+      next(new Error(`Account session verification failed: ${error.message}`));
+    }
   });
 
   async function listen(port) {
@@ -143,6 +151,9 @@ export function createGameServer(opts = {}) {
       graceMs: opts.graceMs,
       intermissionMs: opts.intermissionMs,
       privateLobbyGraceMs: opts.privateLobbyGraceMs,
+      rankedRange: opts.rankedRange,
+      rankedRangeWaitMs: opts.rankedRangeWaitMs,
+      requireAccounts: opts.requireAccounts,
       log: (...args) => console.warn('[rooms]', ...args),
     });
     io.on('connection', (socket) => {

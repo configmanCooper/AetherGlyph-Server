@@ -3,11 +3,46 @@
 // PostgreSQL is authoritative when DATABASE_URL is configured. The memory
 // adapter mirrors the same behavior for tests, LAN hosting, and local dev.
 
+import crypto from 'node:crypto';
+import { promisify } from 'node:util';
+
+const scrypt = promisify(crypto.scrypt);
+
 export const DEFAULT_GLYPHS = 100;
 export const GLYPH_TRANSFER_MIN = 5;
 export const GLYPH_TRANSFER_MAX = 50;
 export const GLYPH_TRANSFER_EQUAL = 25;
 export const SEASON_CHECK_MS = 60 * 60 * 1000;
+export const TEMP_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const USERNAME_PATTERN = /^[A-Za-z0-9]{1,24}$/;
+export const PIN_PATTERN = /^\d{6}$/;
+
+export function normalizeUsername(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+export function validateTemporaryCredentials(username, pin) {
+  if (!USERNAME_PATTERN.test(String(username || ''))) {
+    return { ok: false, code: 'invalid-username' };
+  }
+  if (!PIN_PATTERN.test(String(pin || ''))) {
+    return { ok: false, code: 'invalid-pin' };
+  }
+  return { ok: true };
+}
+
+async function derivePinHash(pin, salt) {
+  const value = await scrypt(String(pin), salt, 32);
+  return Buffer.from(value).toString('hex');
+}
+
+function hashSessionToken(token) {
+  return crypto.createHash('sha256').update(String(token || '')).digest('hex');
+}
+
+function createSessionToken() {
+  return crypto.randomBytes(32).toString('base64url');
+}
 
 function cleanName(value) {
   return String(value || '').trim().slice(0, 24);
@@ -94,6 +129,9 @@ class MemoryRatingStore {
     this.kind = 'memory';
     this.accounts = new Map();
     this.results = new Map();
+    this.credentials = new Map();
+    this.sessions = new Map();
+    this.credentialLocks = new Map();
     this.seasons = [];
     this.currentSeasonStart = null;
     this.seasonTimer = null;
@@ -146,6 +184,81 @@ class MemoryRatingStore {
   rankOf(accountId) {
     const index = this.rankedAccounts().findIndex((account) => account.id === accountId);
     return index < 0 ? null : index + 1;
+  }
+
+  async withCredentialLock(key, action) {
+    const previous = this.credentialLocks.get(key) || Promise.resolve();
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const current = previous.then(() => gate);
+    this.credentialLocks.set(key, current);
+    await previous;
+    try {
+      return await action();
+    } finally {
+      release();
+      if (this.credentialLocks.get(key) === current) this.credentialLocks.delete(key);
+    }
+  }
+
+  async authenticateTemporary(username, pin) {
+    const validation = validateTemporaryCredentials(username, pin);
+    if (!validation.ok) return validation;
+    const usernameKey = normalizeUsername(username);
+    return this.withCredentialLock(usernameKey, () =>
+      this.authenticateTemporaryUnlocked(username, pin, usernameKey));
+  }
+
+  async authenticateTemporaryUnlocked(username, pin, usernameKey) {
+    let credential = this.credentials.get(usernameKey);
+    let created = false;
+    if (credential) {
+      const hash = await derivePinHash(pin, credential.salt);
+      const expected = Buffer.from(credential.hash, 'hex');
+      const actual = Buffer.from(hash, 'hex');
+      if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
+        return { ok: false, code: 'name-taken' };
+      }
+    } else {
+      const accountId = `acct-${crypto.randomUUID()}`;
+      const salt = crypto.randomBytes(16).toString('hex');
+      const hash = await derivePinHash(pin, salt);
+      const account = this.ensureAccount(accountId, username);
+      account.displayName = username;
+      credential = { accountId, name: username, salt, hash };
+      this.credentials.set(usernameKey, credential);
+      created = true;
+    }
+    const token = createSessionToken();
+    this.sessions.set(hashSessionToken(token), {
+      accountId: credential.accountId,
+      expiresAt: Date.now() + TEMP_SESSION_TTL_MS,
+    });
+    const rankings = await this.getLeaderboard(credential.accountId, credential.name, 100);
+    return {
+      ok: true,
+      created,
+      accountId: credential.accountId,
+      name: credential.name,
+      token,
+      profile: rankings.self,
+    };
+  }
+
+  async resolveTemporarySession(token) {
+    const key = hashSessionToken(token);
+    const session = this.sessions.get(key);
+    if (!session) return null;
+    if (session.expiresAt <= Date.now()) {
+      this.sessions.delete(key);
+      return null;
+    }
+    const account = this.accounts.get(session.accountId);
+    if (!account) return null;
+    return {
+      accountId: account.id,
+      name: account.displayName,
+    };
   }
 
   async getGlyphs(accountId, name = '') {
@@ -335,6 +448,59 @@ class PostgresRatingStore {
           PRIMARY KEY (provider, provider_user_id)
         )`);
       await schema.query(`
+        CREATE TABLE IF NOT EXISTS temporary_credentials (
+          username_key TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL UNIQUE REFERENCES accounts(id) ON DELETE CASCADE,
+          pin_salt TEXT NOT NULL,
+          pin_hash TEXT NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )`);
+      await schema.query(`
+        ALTER TABLE temporary_credentials
+          ADD COLUMN IF NOT EXISTS failed_attempts INTEGER NOT NULL DEFAULT 0,
+          ADD COLUMN IF NOT EXISTS blocked_until TIMESTAMPTZ
+      `);
+      await schema.query(`
+        CREATE TABLE IF NOT EXISTS temporary_sessions (
+          token_hash TEXT PRIMARY KEY,
+          account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+          expires_at TIMESTAMPTZ NOT NULL,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )`);
+      await schema.query(`
+        CREATE INDEX IF NOT EXISTS temporary_sessions_expiry_idx
+        ON temporary_sessions (expires_at)
+      `);
+      await schema.query(`
+        CREATE TABLE IF NOT EXISTS schema_migrations (
+          migration_key TEXT PRIMARY KEY,
+          applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+      `);
+      // The pre-auth test leaderboard used client-chosen anonymous ids. Keep the
+      // rows for deletion/history purposes but remove them from competitive rank.
+      const legacyReset = await schema.query(`
+        INSERT INTO schema_migrations (migration_key)
+        VALUES ('2026-07-temporary-accounts-reset-anonymous-rankings')
+        ON CONFLICT DO NOTHING
+        RETURNING migration_key
+      `);
+      if (legacyReset.rows.length) {
+        await schema.query(`
+          UPDATE accounts a SET
+            glyphs = ${DEFAULT_GLYPHS},
+            ranked_games = 0,
+            ranked_wins = 0,
+            ranked_losses = 0,
+            ranked_draws = 0,
+            updated_at = now()
+          WHERE ranked_games > 0
+            AND NOT EXISTS (
+              SELECT 1 FROM temporary_credentials c WHERE c.account_id = a.id
+            )
+        `);
+      }
+      await schema.query(`
         CREATE INDEX IF NOT EXISTS accounts_world_rank_idx
         ON accounts (glyphs DESC, ranked_wins DESC, ranked_losses ASC, glyphs_reached_at ASC)
         WHERE ranked_games > 0
@@ -369,6 +535,136 @@ class PostgresRatingStore {
       [accountId, cleanName(name), DEFAULT_GLYPHS],
     );
     return rows[0];
+  }
+
+  async issueTemporarySession(accountId) {
+    const token = createSessionToken();
+    const expiresAt = new Date(Date.now() + TEMP_SESSION_TTL_MS);
+    await this.pool.query(
+      `INSERT INTO temporary_sessions (token_hash, account_id, expires_at)
+       VALUES ($1, $2, $3)`,
+      [hashSessionToken(token), accountId, expiresAt],
+    );
+    return token;
+  }
+
+  async authenticateTemporary(username, pin) {
+    const validation = validateTemporaryCredentials(username, pin);
+    if (!validation.ok) return validation;
+    const usernameKey = normalizeUsername(username);
+    const existing = await this.pool.query(
+      `SELECT c.account_id, c.pin_salt, c.pin_hash, c.failed_attempts,
+         c.blocked_until, a.display_name
+       FROM temporary_credentials c
+       JOIN accounts a ON a.id = c.account_id
+       WHERE c.username_key = $1`,
+      [usernameKey],
+    );
+    let accountId;
+    let displayName;
+    let created = false;
+    if (existing.rows.length) {
+      const credential = existing.rows[0];
+      if (credential.blocked_until && new Date(credential.blocked_until).getTime() > Date.now()) {
+        return { ok: false, code: 'rate' };
+      }
+      const hash = await derivePinHash(pin, credential.pin_salt);
+      const expected = Buffer.from(credential.pin_hash, 'hex');
+      const actual = Buffer.from(hash, 'hex');
+      if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
+        const failures = Number(credential.failed_attempts) + 1;
+        const blockSeconds = failures >= 5
+          ? Math.min(600, 30 * 2 ** Math.min(4, failures - 5))
+          : 0;
+        await this.pool.query(
+          `UPDATE temporary_credentials SET
+             failed_attempts = $2,
+             blocked_until = CASE
+               WHEN $3 > 0 THEN now() + ($3 * interval '1 second')
+               ELSE blocked_until
+             END
+           WHERE username_key = $1`,
+          [usernameKey, failures, blockSeconds],
+        );
+        return { ok: false, code: 'name-taken' };
+      }
+      await this.pool.query(
+        `UPDATE temporary_credentials
+         SET failed_attempts = 0, blocked_until = NULL
+         WHERE username_key = $1`,
+        [usernameKey],
+      );
+      accountId = credential.account_id;
+      displayName = credential.display_name;
+    } else {
+      accountId = `acct-${crypto.randomUUID()}`;
+      displayName = username;
+      const salt = crypto.randomBytes(16).toString('hex');
+      const hash = await derivePinHash(pin, salt);
+      const client = await this.pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(
+          `INSERT INTO accounts (id, display_name, glyphs)
+           VALUES ($1, $2, $3)`,
+          [accountId, displayName, DEFAULT_GLYPHS],
+        );
+        const inserted = await client.query(
+          `INSERT INTO temporary_credentials (
+             username_key, account_id, pin_salt, pin_hash
+           ) VALUES ($1, $2, $3, $4)
+           ON CONFLICT (username_key) DO NOTHING
+           RETURNING username_key`,
+          [usernameKey, accountId, salt, hash],
+        );
+        if (!inserted.rows.length) {
+          await client.query('ROLLBACK');
+          return this.authenticateTemporary(username, pin);
+        }
+        await client.query(
+          `INSERT INTO account_identities (provider, provider_user_id, account_id)
+           VALUES ('temporary-pin', $1, $2)
+           ON CONFLICT (provider, provider_user_id) DO NOTHING`,
+          [usernameKey, accountId],
+        );
+        await client.query('COMMIT');
+        created = true;
+      } catch (error) {
+        try { await client.query('ROLLBACK'); } catch { /* original error wins */ }
+        if (error?.code === '23505') return this.authenticateTemporary(username, pin);
+        throw error;
+      } finally {
+        client.release();
+      }
+    }
+
+    await this.pool.query('DELETE FROM temporary_sessions WHERE expires_at <= now()');
+    const token = await this.issueTemporarySession(accountId);
+    const rankings = await this.getLeaderboard(accountId, displayName, 100);
+    return {
+      ok: true,
+      created,
+      accountId,
+      name: displayName,
+      token,
+      profile: rankings.self,
+    };
+  }
+
+  async resolveTemporarySession(token) {
+    if (typeof token !== 'string' || token.length < 20 || token.length > 256) return null;
+    const { rows } = await this.pool.query(
+      `SELECT s.account_id, a.display_name
+       FROM temporary_sessions s
+       JOIN accounts a ON a.id = s.account_id
+       WHERE s.token_hash = $1 AND s.expires_at > now()`,
+      [hashSessionToken(token)],
+    );
+    if (!rows.length) return null;
+    return {
+      accountId: rows[0].account_id,
+      name: rows[0].display_name,
+    };
   }
 
   async getGlyphs(accountId, name = '') {
@@ -768,7 +1064,9 @@ export async function createRatingStore(opts = {}) {
     try {
       const pg = await import('pg');
       const Pool = pg.default?.Pool || pg.Pool;
-      const ssl = /localhost|127\.0\.0\.1/.test(url) ? false : { rejectUnauthorized: false };
+      const ssl = /localhost|127\.0\.0\.1/.test(url)
+        ? false
+        : { rejectUnauthorized: process.env.PGSSL_REJECT_UNAUTHORIZED !== 'false' };
       pool = new Pool({ connectionString: url, ssl, max: opts.max || 4 });
       const store = new PostgresRatingStore(pool);
       await store.init();

@@ -5,6 +5,8 @@
 export const EVENTS = Object.freeze({
   // ---- client -> server ------------------------------------------------
   CREATE_ROOM: 'aeth:createRoom',   // { loadout:[ids], name? } -> ack {ok, code, slot, ...}
+  ACCOUNT_AUTH: 'aeth:accountAuth', // { username, pin } temporary register/login
+  ACCOUNT_STATUS: 'aeth:accountStatus', // {} -> authenticated account state
   JOIN_ROOM: 'aeth:joinRoom',       // { code, loadout:[ids], name? }
   QUICK_MATCH: 'aeth:quickMatch',   // { loadout:[ids], name? } ranked compatibility path
   QUICK_MATCH_UNRANKED: 'aeth:quickMatchUnranked', // { loadout:[ids], name? }
@@ -51,6 +53,10 @@ export const ERR = Object.freeze({
   BAD_TOKEN: 'bad-token',       // resume token invalid / expired / used
   DRAINING: 'draining',         // server preparing to restart
   IN_MATCH: 'in-match',         // already in a room/match
+  AUTH_REQUIRED: 'auth-required', // temporary account login required
+  INVALID_USERNAME: 'invalid-username',
+  INVALID_PIN: 'invalid-pin',
+  NAME_TAKEN: 'name-taken',
 });
 
 // Queue / room lifecycle states surfaced to the client waiting UI.

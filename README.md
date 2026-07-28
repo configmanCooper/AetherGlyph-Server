@@ -2,7 +2,8 @@
 
 This is a separate, asset-free deployment package for Aetherglyph online play.
 It contains only the deterministic simulation, gesture recognizer, matchmaking,
-private rooms, reconnect/resume handling, and PostgreSQL-backed Glyph rankings.
+private rooms, reconnect/resume handling, temporary username/PIN authentication,
+and PostgreSQL-backed Glyph rankings.
 
 It does **not** include or serve the game client, Three.js, graphics, music, or
 screenshots. Android, Windows, and web clients carry their own assets and connect

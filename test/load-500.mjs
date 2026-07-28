@@ -16,10 +16,12 @@ const server = createGameServer({
   secret: 'load-test-secret',
   ratingStore: {
     kind: 'load-test',
-    getRating: async () => 1000,
+    getGlyphs: async () => 100,
+    getLeaderboard: async () => ({ season: 'test', top: [], self: null }),
     recordResult: async () => {},
     close: async () => {},
   },
+  requireAccounts: false,
 });
 const sockets = [];
 let snapshots = 0;

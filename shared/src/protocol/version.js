@@ -3,7 +3,7 @@
 
 import { SPELLS_SOURCE_CHECKSUM } from '../balance/spellData.generated.js';
 
-export const PROTOCOL_VERSION = 4;
+export const PROTOCOL_VERSION = 5;
 export const BALANCE_VERSION = 29;
 export const APP_PHASE = 5;
 export const APP_VERSION = '1.12.0';
