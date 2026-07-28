@@ -479,26 +479,33 @@ class PostgresRatingStore {
       `);
       // The pre-auth test leaderboard used client-chosen anonymous ids. Keep the
       // rows for deletion/history purposes but remove them from competitive rank.
-      const legacyReset = await schema.query(`
-        INSERT INTO schema_migrations (migration_key)
-        VALUES ('2026-07-temporary-accounts-reset-anonymous-rankings')
-        ON CONFLICT DO NOTHING
-        RETURNING migration_key
-      `);
-      if (legacyReset.rows.length) {
-        await schema.query(`
-          UPDATE accounts a SET
-            glyphs = ${DEFAULT_GLYPHS},
-            ranked_games = 0,
-            ranked_wins = 0,
-            ranked_losses = 0,
-            ranked_draws = 0,
-            updated_at = now()
-          WHERE ranked_games > 0
-            AND NOT EXISTS (
-              SELECT 1 FROM temporary_credentials c WHERE c.account_id = a.id
-            )
+      await schema.query('BEGIN');
+      try {
+        const legacyReset = await schema.query(`
+          INSERT INTO schema_migrations (migration_key)
+          VALUES ('2026-07-temporary-accounts-reset-anonymous-rankings')
+          ON CONFLICT DO NOTHING
+          RETURNING migration_key
         `);
+        if (legacyReset.rows.length) {
+          await schema.query(`
+            UPDATE accounts a SET
+              glyphs = ${DEFAULT_GLYPHS},
+              ranked_games = 0,
+              ranked_wins = 0,
+              ranked_losses = 0,
+              ranked_draws = 0,
+              updated_at = now()
+            WHERE ranked_games > 0
+              AND NOT EXISTS (
+                SELECT 1 FROM temporary_credentials c WHERE c.account_id = a.id
+              )
+          `);
+        }
+        await schema.query('COMMIT');
+      } catch (error) {
+        try { await schema.query('ROLLBACK'); } catch { /* original error wins */ }
+        throw error;
       }
       await schema.query(`
         CREATE INDEX IF NOT EXISTS accounts_world_rank_idx
@@ -572,19 +579,20 @@ class PostgresRatingStore {
       const expected = Buffer.from(credential.pin_hash, 'hex');
       const actual = Buffer.from(hash, 'hex');
       if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
-        const failures = Number(credential.failed_attempts) + 1;
-        const blockSeconds = failures >= 5
-          ? Math.min(600, 30 * 2 ** Math.min(4, failures - 5))
-          : 0;
         await this.pool.query(
           `UPDATE temporary_credentials SET
-             failed_attempts = $2,
+             failed_attempts = failed_attempts + 1,
              blocked_until = CASE
-               WHEN $3 > 0 THEN now() + ($3 * interval '1 second')
+               WHEN failed_attempts + 1 >= 5 THEN now() + make_interval(
+                 secs => LEAST(
+                   600,
+                   (30 * POWER(2, LEAST(4, failed_attempts + 1 - 5)))::integer
+                 )
+               )
                ELSE blocked_until
              END
            WHERE username_key = $1`,
-          [usernameKey, failures, blockSeconds],
+          [usernameKey],
         );
         return { ok: false, code: 'name-taken' };
       }

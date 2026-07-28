@@ -51,12 +51,20 @@ export class RoomManager {
 
   // ---- socket wiring -----------------------------------------------------
   authBucket(map, key, rate, burst) {
-    let bucket = map.get(key);
-    if (!bucket) {
-      bucket = new TokenBucket(rate, burst);
-      map.set(key, bucket);
+    const now = Date.now();
+    let entry = map.get(key);
+    if (!entry) {
+      entry = { bucket: new TokenBucket(rate, burst), lastSeen: now };
+      map.set(key, entry);
     }
-    return bucket;
+    entry.lastSeen = now;
+    if (map.size > 1024) {
+      for (const [storedKey, stored] of map) {
+        if (now - stored.lastSeen > 10 * 60 * 1000) map.delete(storedKey);
+      }
+      while (map.size > 2048) map.delete(map.keys().next().value);
+    }
+    return entry.bucket;
   }
 
   allowAccountAttempt(socket, username) {
@@ -536,6 +544,10 @@ export class RoomManager {
     }
     const token = verifyToken(this.secret, payload && payload.token);
     if (!token) { this.ack(ack, { ok: false, code: ERR.BAD_TOKEN }); return; }
+    if (token.accountId !== socket.data.accountId) {
+      this.ack(ack, { ok: false, code: ERR.BAD_TOKEN });
+      return;
+    }
     const match = this.matches.get(token.matchId);
     if (!match) { this.ack(ack, { ok: false, code: ERR.NO_ROOM }); return; }
     const res = match.resume(token, socket);
