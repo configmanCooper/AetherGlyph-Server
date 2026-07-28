@@ -6,7 +6,8 @@ export const EVENTS = Object.freeze({
   // ---- client -> server ------------------------------------------------
   CREATE_ROOM: 'aeth:createRoom',   // { loadout:[ids], name? } -> ack {ok, code, slot, ...}
   JOIN_ROOM: 'aeth:joinRoom',       // { code, loadout:[ids], name? }
-  QUICK_MATCH: 'aeth:quickMatch',   // { loadout:[ids], name?, rating? }
+  QUICK_MATCH: 'aeth:quickMatch',   // { loadout:[ids], name? } ranked compatibility path
+  QUICK_MATCH_UNRANKED: 'aeth:quickMatchUnranked', // { loadout:[ids], name? }
   CANCEL_QUEUE: 'aeth:cancelQueue', // {}
   PRIVATE_READY: 'aeth:privateReady', // { loadout:[ids], name? } ready for private duel/rematch
   PRIVATE_UNREADY: 'aeth:privateUnready', // {} leave ready state before editing

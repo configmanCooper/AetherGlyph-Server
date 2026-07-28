@@ -412,7 +412,15 @@ export class MatchRoom {
         this.intermissionRemainingMs = 0;
       }
     }
-    return { ok: true, matchId: this.matchId, slot: seat.slot, epoch: seat.epoch, token: newToken };
+    return {
+      ok: true,
+      matchId: this.matchId,
+      slot: seat.slot,
+      epoch: seat.epoch,
+      token: newToken,
+      ranked: this.ranked,
+      code: this.code,
+    };
   }
 
   // ---- teardown ----------------------------------------------------------

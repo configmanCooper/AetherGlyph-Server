@@ -55,6 +55,9 @@ export class RoomManager {
     socket.on(EVENTS.CREATE_ROOM, (p, ack) => this.createRoom(socket, p || {}, ack));
     socket.on(EVENTS.JOIN_ROOM, (p, ack) => this.joinRoom(socket, p || {}, ack));
     socket.on(EVENTS.QUICK_MATCH, (p, ack) => this.quickMatch(socket, p || {}, ack));
+    socket.on(EVENTS.QUICK_MATCH_UNRANKED, (p, ack) => {
+      this.quickMatch(socket, { ...(p || {}), ranked: false }, ack);
+    });
     socket.on(EVENTS.CANCEL_QUEUE, (p, ack) => this.cancelQueue(socket, ack));
     socket.on(EVENTS.PRIVATE_READY, (p, ack) => {
       if (!socket.data.auxiliary.take()) { this.ack(ack, { ok: false, code: ERR.RATE }); return; }
@@ -186,14 +189,18 @@ export class RoomManager {
     const v = validateSeatLoadout(ids);
     if (!v.valid) { this.ack(ack, { ok: false, code: ERR.INVALID_LOADOUT, errors: v.errors }); return; }
     if (payload.name) socket.data.name = sanitizeName(payload.name, socket.data.name);
+    const ranked = payload.ranked !== false;
     let rating = 1000;
     try { rating = await this.ratingStore.getRating(socket.data.accountId); } catch { /* default */ }
     if (socket.data.loc || this.draining || !socket.connected) return; // state changed while awaiting
-    const entry = { socket, accountId: socket.data.accountId, name: socket.data.name, loadoutIds: ids, rating, since: Date.now() };
+    const entry = {
+      socket, accountId: socket.data.accountId, name: socket.data.name,
+      loadoutIds: ids, rating, ranked, since: Date.now(),
+    };
     this.queue.push(entry);
     socket.data.loc = { type: 'queue' };
-    this.ack(ack, { ok: true, state: ROOM_STATE.QUEUED, rating });
-    socket.emit(EVENTS.ROOM_UPDATE, { state: ROOM_STATE.QUEUED });
+    this.ack(ack, { ok: true, state: ROOM_STATE.QUEUED, rating, ranked });
+    socket.emit(EVENTS.ROOM_UPDATE, { state: ROOM_STATE.QUEUED, ranked });
     this.matchmake();
   }
 
@@ -214,13 +221,18 @@ export class RoomManager {
       if (used.has(q[i]) || !q[i].socket.connected) continue;
       let best = null; let bestDiff = Infinity;
       for (let j = 0; j < q.length; j++) {
-        if (i === j || used.has(q[j]) || !q[j].socket.connected) continue;
+        if (i === j || used.has(q[j]) || !q[j].socket.connected
+            || q[j].ranked !== q[i].ranked) continue;
         const diff = Math.abs(q[i].rating - q[j].rating);
         if (diff < bestDiff) { bestDiff = diff; best = q[j]; }
       }
       if (!best) continue;
       const allowed = Math.max(bandFor(now - q[i].since), bandFor(now - best.since));
-      if (bestDiff <= allowed) { used.add(q[i]); used.add(best); this.startMatch([q[i], best], { ranked: true }); }
+      if (bestDiff <= allowed) {
+        used.add(q[i]);
+        used.add(best);
+        this.startMatch([q[i], best], { ranked: q[i].ranked });
+      }
     }
     if (used.size) this.queue = this.queue.filter((e) => !used.has(e));
   }
