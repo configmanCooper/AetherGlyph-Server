@@ -20,10 +20,14 @@ import {
 } from '../shared/src/protocol/net.js';
 import { signToken, randomId } from './tokens.js';
 import { TokenBucket } from './util.js';
+import { PracticeBot } from '../shared/src/bot/practiceBot.js';
 
 const TICK_MS = 1000 / NET.TICK_HZ;
 const MAX_CATCHUP = 6;
 const INTERMISSION_MS = 2800;
+const EMOJI_KINDS = new Set(['smile', 'angry', 'cry', 'laugh']);
+const EMOJI_COOLDOWN_MS = 10000;
+const EMOJI_DURATION_MS = 2000;
 
 // A single full-roster template set is shared by every match. Building it once
 // keeps authoritative classification deterministic + cheap.
@@ -65,6 +69,11 @@ export class MatchRoom {
         accountId: s.accountId,
         name: s.name || `Wizard ${slot + 1}`,
         glyphs: Number.isFinite(s.glyphs) ? s.glyphs : 100,
+        isBot: !!s.isBot,
+        botKey: s.botKey || null,
+        botDifficulty: s.botDifficulty || null,
+        botController: null,
+        emojiReadyAt: 0,
         loadoutIds: s.loadoutIds.slice(),
         loadout,
         recognizer: BASE_RECOGNIZER,
@@ -93,6 +102,8 @@ export class MatchRoom {
     this.intermissionDeadline = 0;
     this.intermissionRemainingMs = 0;
     this.closed = false;
+    this.spectators = new Map();
+    this.lastCasts = [null, null];
   }
 
   seatBySocketId(id) { return this.seats.find((s) => s.socket && s.socket.id === id); }
@@ -104,6 +115,40 @@ export class MatchRoom {
     this.beginRound();
     this.lastTickTime = Date.now();
     this.interval = setInterval(() => this.loop(), TICK_MS);
+  }
+
+  spectatorInfo() {
+    return {
+      matchId: this.matchId,
+      ranked: this.ranked,
+      names: this.seats.map((seat) => seat.name),
+      glyphs: this.seats.map((seat) => seat.glyphs),
+      score: this.series.score.slice(),
+      state: this.state,
+      bot: this.seats.some((seat) => seat.isBot),
+    };
+  }
+
+  addSpectator(socket) {
+    if (!socket || this.closed || !this.ranked) return { ok: false, code: ERR.BAD_STATE };
+    this.spectators.set(socket.id, socket);
+    socket.emit(EVENTS.SPECTATE_START, this.spectatorInfo());
+    if (this.sim) {
+      socket.emit(EVENTS.SPECTATE_SNAPSHOT, {
+        matchId: this.matchId,
+        tick: this.sim.tick,
+        full: true,
+        state: this.sim.snapshot(),
+        events: [],
+        lastCasts: this.lastCasts.slice(),
+      });
+    }
+    return { ok: true, ...this.spectatorInfo() };
+  }
+
+  removeSpectator(socket) {
+    if (!socket) return;
+    this.spectators.delete(socket.id);
   }
 
   sendMatchStart(seat) {
@@ -139,7 +184,15 @@ export class MatchRoom {
     this.sim = this.series.newRoundSim();
     this.tickCount = 0;
     this.roundEvents = [];
-    for (const seat of this.seats) Object.assign(seat, freshSeatRuntime());
+    for (const seat of this.seats) {
+      Object.assign(seat, freshSeatRuntime());
+      if (seat.isBot) {
+        seat.botController = new PracticeBot(seat.slot, {
+          difficulty: seat.botDifficulty,
+          seed: this.seed ^ ((this.series.roundIndex + 1) * 0x9e3779b9),
+        });
+      }
+    }
     this.state = 'live';
     this.pushEvent({ type: 'roundStart', round: this.series.roundIndex, score: this.series.score.slice() });
     this.broadcastSnapshot(true);
@@ -179,7 +232,12 @@ export class MatchRoom {
   stepOnce() {
     const intents = { 0: this.buildIntent(this.seats[0]), 1: this.buildIntent(this.seats[1]) };
     const evs = this.sim.step(intents);
-    for (const e of evs) this.roundEvents.push(e);
+    for (const e of evs) {
+      this.roundEvents.push(e);
+      if (e.type === 'cast' && (e.caster === 0 || e.caster === 1)) {
+        this.lastCasts[e.caster] = e.spellId;
+      }
+    }
     this.tickCount += 1;
     if (this.sim.ended) { this.handleRoundEnd(); return; }
     if (this.tickCount % NET.SNAPSHOT_EVERY_TICKS === 0) this.broadcastSnapshot(false);
@@ -187,6 +245,11 @@ export class MatchRoom {
 
   buildIntent(seat) {
     if (!seat.connected) return {};
+    if (seat.isBot) {
+      const intent = seat.botController?.act(this.sim) || {};
+      if (intent.cast != null || intent.castReject != null) intent.castWasGesture = true;
+      return intent;
+    }
     const i = seat.inputState;
     const intent = { move: i.move, focus: i.focus, brace: i.brace };
     if (seat.pendingSidestep) { intent.sidestep = seat.pendingSidestep; seat.pendingSidestep = 0; }
@@ -220,6 +283,16 @@ export class MatchRoom {
         full: !!force,
         state: remapSnapshotForSlot(canon, seat.slot),
         events: remapEventsForSlot(events, seat.slot),
+      });
+    }
+    for (const spectator of this.spectators.values()) {
+      (force ? spectator : spectator.volatile).emit(EVENTS.SPECTATE_SNAPSHOT, {
+        matchId: this.matchId,
+        tick: canon.tick,
+        full: !!force,
+        state: canon,
+        events,
+        lastCasts: this.lastCasts.slice(),
       });
     }
   }
@@ -261,6 +334,16 @@ export class MatchRoom {
         ranked: this.ranked,
       });
     }
+    for (const spectator of this.spectators.values()) {
+      spectator.emit(EVENTS.SPECTATE_END, {
+        matchId: this.matchId,
+        winner: winnerSlot,
+        reason,
+        score: this.series.score.slice(),
+      });
+      spectator.data.loc = null;
+    }
+    this.spectators.clear();
     // Glyph persistence is delegated. The match closes immediately; the
     // personalized ranking update follows when the atomic transaction commits.
     try {
@@ -269,7 +352,13 @@ export class MatchRoom {
         ranked: this.ranked,
         winnerSlot,
         reason,
-        players: this.seats.map((s) => ({ accountId: s.accountId, name: s.name })),
+        players: this.seats.map((s) => ({
+          accountId: s.accountId,
+          name: s.name,
+          glyphs: s.glyphs,
+          isBot: s.isBot,
+          botKey: s.botKey,
+        })),
       })).then((ranking) => {
         if (!ranking?.ranked || !Array.isArray(ranking.players)) return;
         this.seats.forEach((seat, slot) => {
@@ -363,6 +452,50 @@ export class MatchRoom {
     return { ok: true, accepted: true, spellId: diag.spellId };
   }
 
+  handleEmoji(slot, payload) {
+    const seat = this.seats[slot];
+    if (!seat || seat.isBot || !seat.connected || this.state !== 'live') {
+      return { ok: false, code: ERR.BAD_STATE };
+    }
+
+    const kind = String(payload?.kind || '');
+    if (!EMOJI_KINDS.has(kind)) return { ok: false, code: ERR.PAYLOAD };
+    const now = Date.now();
+    if (seat.emojiReadyAt > now) {
+      return {
+        ok: false,
+        code: ERR.RATE,
+        cooldownMs: seat.emojiReadyAt - now,
+      };
+    }
+    seat.emojiReadyAt = now + EMOJI_COOLDOWN_MS;
+    for (const recipient of this.seats) {
+      if (!recipient.socket) continue;
+      recipient.socket.emit(EVENTS.EMOJI_EVENT, {
+        matchId: this.matchId,
+        sender: recipient.slot === slot ? 0 : 1,
+        kind,
+        durationMs: EMOJI_DURATION_MS,
+        cooldownMs: EMOJI_COOLDOWN_MS,
+      });
+    }
+    this.broadcastEmojiToSpectators(slot, kind, EMOJI_DURATION_MS);
+    return { ok: true, cooldownMs: EMOJI_COOLDOWN_MS };
+  }
+
+  broadcastEmojiToSpectators(sender, kind, durationMs) {
+    for (const spectator of this.spectators.values()) {
+      spectator.emit(EVENTS.EMOJI_EVENT, {
+        matchId: this.matchId,
+        sender,
+        kind,
+        durationMs,
+        cooldownMs: EMOJI_COOLDOWN_MS,
+        spectator: true,
+      });
+    }
+  }
+
   handleLeave(slot) {
     const seat = this.seats[slot];
     if (!seat) return;
@@ -373,7 +506,7 @@ export class MatchRoom {
   // ---- disconnect / reconnect -------------------------------------------
   onDisconnect(slot) {
     const seat = this.seats[slot];
-    if (!seat || !seat.connected) return;
+    if (!seat || seat.isBot || !seat.connected) return;
     seat.connected = false;
     seat.socket = null;
     seat.disconnectCount += 1;
@@ -468,6 +601,8 @@ export class MatchRoom {
     this.intermissionDeadline = 0;
     this.intermissionRemainingMs = 0;
     for (const seat of this.seats) if (seat.graceTimer) { clearTimeout(seat.graceTimer); seat.graceTimer = null; }
+    for (const spectator of this.spectators.values()) spectator.data.loc = null;
+    this.spectators.clear();
     try { this.onClosed(this, reason); } catch { /* cleanup best-effort */ }
   }
 
@@ -476,6 +611,12 @@ export class MatchRoom {
     if (this.closed) return;
     for (const seat of this.seats) {
       if (seat.socket) seat.socket.emit(EVENTS.ABORTED, { reason: reason || 'Server restarting' });
+    }
+    for (const spectator of this.spectators.values()) {
+      spectator.emit(EVENTS.SPECTATE_END, {
+        matchId: this.matchId,
+        reason: reason || 'Server restarting',
+      });
     }
     this.stop(reason || 'aborted');
   }

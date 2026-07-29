@@ -10,6 +10,13 @@ import { NET } from '../shared/src/protocol/net.js';
 import { MatchRoom, validateSeatLoadout } from './matchRoom.js';
 import { verifyToken, randomId } from './tokens.js';
 import { TokenBucket, roomCode, normalizeCode } from './util.js';
+import { chooseOpponentLoadout } from '../shared/src/bot/practiceBot.js';
+
+const BOT_SPECS = Object.freeze([
+  { key: 'easy', name: 'EasyAIbot', difficulty: 'easy', glyphs: 50 },
+  { key: 'medium', name: 'MediumAIbot', difficulty: 'medium', glyphs: 100 },
+  { key: 'hard', name: 'HardAIbot', difficulty: 'hard', glyphs: 150 },
+]);
 
 function sanitizeName(value, fallback) {
   const s = String(value == null ? '' : value).replace(/[\u0000-\u001f]/g, '').trim().slice(0, 24);
@@ -37,6 +44,7 @@ export class RoomManager {
     this.privateLobbyGraceMs = opts.privateLobbyGraceMs ?? 2 * 60 * 1000;
     this.rankedRange = opts.rankedRange ?? 50;
     this.rankedRangeWaitMs = opts.rankedRangeWaitMs ?? 3000;
+    this.botOfferWaitMs = opts.botOfferWaitMs ?? 5000;
     this.requireAccounts = opts.requireAccounts !== false;
     this.privateLobbies = new Map(); // code -> { code, seats, ready }
     this.queue = [];               // { socket, accountId, name, loadoutIds, glyphs, ranked, since }
@@ -109,12 +117,37 @@ export class RoomManager {
           this.ack(ack, result);
           return;
         }
+        if (result.resetRequired) {
+          socket.data.authenticated = false;
+          this.ack(ack, result);
+          return;
+        }
         socket.data.accountId = result.accountId;
         socket.data.name = result.name;
         socket.data.authenticated = true;
         this.ack(ack, result);
       } catch (error) {
         this.log('temporary account authentication failed', error?.message);
+        this.ack(ack, { ok: false, code: ERR.BAD_STATE });
+      }
+    });
+    socket.on(EVENTS.ACCOUNT_PIN_RESET, async (p, ack) => {
+      if (!socket.data.authLimiter.take()) {
+        this.ack(ack, { ok: false, code: ERR.RATE });
+        return;
+      }
+      try {
+        const result = await this.ratingStore.resetTemporaryPin(p?.resetToken, p?.pin);
+        if (!result.ok) {
+          this.ack(ack, result);
+          return;
+        }
+        socket.data.accountId = result.accountId;
+        socket.data.name = result.name;
+        socket.data.authenticated = true;
+        this.ack(ack, result);
+      } catch (error) {
+        this.log('temporary PIN reset failed', error?.message);
         this.ack(ack, { ok: false, code: ERR.BAD_STATE });
       }
     });
@@ -125,6 +158,10 @@ export class RoomManager {
       this.quickMatch(socket, { ...(p || {}), ranked: false }, ack);
     });
     socket.on(EVENTS.CANCEL_QUEUE, (p, ack) => this.cancelQueue(socket, ack));
+    socket.on(EVENTS.BOT_OFFER_RESPONSE, (p, ack) => {
+      if (!socket.data.auxiliary.take()) { this.ack(ack, { ok: false, code: ERR.RATE }); return; }
+      this.botOfferResponse(socket, p || {}, ack);
+    });
     socket.on(EVENTS.PRIVATE_READY, (p, ack) => {
       if (!socket.data.auxiliary.take()) { this.ack(ack, { ok: false, code: ERR.RATE }); return; }
       this.privateReady(socket, p || {}, ack);
@@ -157,6 +194,10 @@ export class RoomManager {
     });
     socket.on(EVENTS.INPUT, (p) => this.routeInput(socket, p || {}));
     socket.on(EVENTS.CAST, (p, ack) => this.routeCast(socket, p || {}, ack));
+    socket.on(EVENTS.EMOJI, (p, ack) => this.routeEmoji(socket, p || {}, ack));
+    socket.on(EVENTS.SPECTATE_LIST, (p, ack) => this.spectateList(socket, ack));
+    socket.on(EVENTS.SPECTATE_JOIN, (p, ack) => this.spectateJoin(socket, p || {}, ack));
+    socket.on(EVENTS.SPECTATE_LEAVE, (p, ack) => this.spectateLeave(socket, ack));
     socket.on(EVENTS.RESUME, (p, ack) => {
       if (!socket.data.auxiliary.take()) { this.ack(ack, { ok: false, code: ERR.RATE }); return; }
       this.resume(socket, p || {}, ack);
@@ -279,7 +320,7 @@ export class RoomManager {
     if (!this.requireAccounts && payload.name) socket.data.name = sanitizeName(payload.name, socket.data.name);
     const ranked = payload.ranked !== false;
     let glyphs = 100;
-    if (ranked) {
+    if (ranked || this.requireAccounts) {
       try {
         glyphs = await this.ratingStore.getGlyphs(socket.data.accountId, socket.data.name);
       } catch { /* default */ }
@@ -304,8 +345,103 @@ export class RoomManager {
     this.ack(ack, { ok: true });
   }
 
+  closestBot(glyphs) {
+    return BOT_SPECS.reduce((best, bot) =>
+      Math.abs(bot.glyphs - glyphs) < Math.abs(best.glyphs - glyphs) ? bot : best);
+  }
+
+  offerBot(entry) {
+    if (entry.botOffer || entry.botDeclined || !entry.socket?.connected) return;
+    const bot = this.closestBot(entry.glyphs);
+    const offerId = randomId(8);
+    entry.botOffer = { offerId, bot };
+    entry.socket.emit(EVENTS.BOT_OFFER, {
+        offerId,
+        ranked: entry.ranked,
+        bot: { key: bot.key, name: bot.name, glyphs: bot.glyphs },
+        playerGlyphs: entry.glyphs,
+        maxReward: entry.ranked && entry.glyphs <= 299 ? 20 : 0,
+        noGlyphReason: !entry.ranked
+          ? 'Unranked bot duels do not change Glyphs.'
+          : entry.glyphs > 299
+            ? 'Wizards over 299 Glyphs gain no Glyphs from AI opponents.'
+            : null,
+    });
+  }
+
+  botOfferResponse(socket, payload, ack) {
+    const entry = this.queue.find((queued) => queued.socket === socket);
+    if (!entry || !entry.botOffer || payload.offerId !== entry.botOffer.offerId) {
+      this.ack(ack, { ok: false, code: ERR.BAD_STATE });
+      return;
+    }
+    const { bot } = entry.botOffer;
+    entry.botOffer = null;
+    if (!payload.accept) {
+      entry.botDeclined = true;
+      this.ack(ack, { ok: true, accepted: false });
+      return;
+    }
+    this.queue = this.queue.filter((queued) => queued !== entry);
+    socket.data.loc = null;
+    const botLoadout = chooseOpponentLoadout(
+        bot.difficulty,
+        entry.loadoutIds,
+        Date.now() & 0x7fffffff,
+    );
+    const botSeat = {
+        accountId: null,
+        name: bot.name,
+        glyphs: bot.glyphs,
+        loadoutIds: botLoadout,
+        socket: null,
+        isBot: true,
+        botKey: bot.key,
+        botDifficulty: bot.difficulty,
+    };
+    this.startMatch([entry, botSeat], { ranked: entry.ranked, bot: true });
+    this.ack(ack, { ok: true, accepted: true, bot: bot.name });
+  }
+
+  activeRankedMatches() {
+    return [...this.matches.values()]
+      .filter((match) => match.ranked && !match.closed
+        && ['live', 'intermission', 'paused'].includes(match.state))
+      .slice(0, 5)
+      .map((match) => match.spectatorInfo());
+  }
+
+  spectateList(socket, ack) {
+    if (this.requireAccounts && !socket.data.authenticated) {
+      this.ack(ack, { ok: false, code: ERR.AUTH_REQUIRED });
+      return;
+    }
+    this.ack(ack, { ok: true, matches: this.activeRankedMatches() });
+  }
+
+  spectateJoin(socket, payload, ack) {
+    if (!this.guard(socket, ack)) return;
+    const match = this.matches.get(String(payload.matchId || ''));
+    if (!match || !match.ranked || match.closed) {
+      this.ack(ack, { ok: false, code: ERR.NO_ROOM });
+      return;
+    }
+    const result = match.addSpectator(socket);
+    if (result.ok) socket.data.loc = { type: 'spectator', matchId: match.matchId };
+    this.ack(ack, result);
+  }
+
+  spectateLeave(socket, ack) {
+    const loc = socket.data.loc;
+    if (loc?.type === 'spectator') {
+      this.matches.get(loc.matchId)?.removeSpectator(socket);
+      socket.data.loc = null;
+    }
+    this.ack(ack, { ok: true });
+  }
+
   matchmake() {
-    if (this.draining || this.queue.length < 2) return;
+    if (this.draining || this.queue.length < 1) return;
     const now = Date.now();
     const q = [...this.queue].sort((a, b) => a.since - b.since);
     const used = new Set();
@@ -327,6 +463,14 @@ export class RoomManager {
         used.add(best);
         this.startMatch([q[i], best], { ranked: q[i].ranked });
       }
+    }
+    for (const entry of q) {
+      if (used.has(entry) || !entry.socket.connected) continue;
+      const hasHuman = q.some((other) =>
+        other !== entry && !used.has(other) && other.socket.connected
+          && other.ranked === entry.ranked
+          && (!entry.accountId || !other.accountId || entry.accountId !== other.accountId));
+      if (!hasHuman && now - entry.since >= this.botOfferWaitMs) this.offerBot(entry);
     }
     if (used.size) this.queue = this.queue.filter((e) => !used.has(e));
   }
@@ -491,6 +635,9 @@ export class RoomManager {
         players: result.players.map((p) => ({
           accountId: p.accountId,
           name: p.name,
+          glyphs: p.glyphs,
+          isBot: p.isBot,
+          botKey: p.botKey,
         })),
       });
     } catch (err) {
@@ -518,6 +665,12 @@ export class RoomManager {
     this.ack(ack, m.match.handleCast(m.slot, payload));
   }
 
+  routeEmoji(socket, payload, ack) {
+    const m = this.matchFor(socket);
+    if (!m) { this.ack(ack, { ok: false, code: ERR.BAD_STATE }); return; }
+    this.ack(ack, m.match.handleEmoji(m.slot, payload));
+  }
+
   leave(socket, ack) {
     const loc = socket.data.loc;
     if (loc && loc.type === 'queue') { this.queue = this.queue.filter((e) => e.socket !== socket); socket.data.loc = null; }
@@ -531,6 +684,9 @@ export class RoomManager {
       const m = this.matches.get(loc.matchId);
       if (m) m.handleLeave(loc.slot);
       if (socket.data.loc?.type === 'match') socket.data.loc = null;
+    } else if (loc && loc.type === 'spectator') {
+      this.matches.get(loc.matchId)?.removeSpectator(socket);
+      socket.data.loc = null;
     }
     this.ack(ack, { ok: true });
   }
@@ -571,6 +727,8 @@ export class RoomManager {
     } else if (loc.type === 'match') {
       const match = this.matches.get(loc.matchId);
       if (match) match.onDisconnect(loc.slot); // keep the match alive for the grace window
+    } else if (loc.type === 'spectator') {
+      this.matches.get(loc.matchId)?.removeSpectator(socket);
     }
     socket.data.loc = null;
   }
@@ -598,6 +756,8 @@ export class RoomManager {
       rooms: this.privateLobbies.size,
       queue: this.queue.length,
       matches: this.matches.size,
+      spectators: [...this.matches.values()]
+        .reduce((sum, match) => sum + match.spectators.size, 0),
     };
   }
 }

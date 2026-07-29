@@ -13,7 +13,7 @@ foreach ($name in @('shared', 'server')) {
   Copy-Item -LiteralPath (Join-Path $GameRoot $name) -Destination $target -Recurse -Force
 }
 
-foreach ($unused in @('shared\src\analytics', 'shared\src\bot')) {
+foreach ($unused in @('shared\src\analytics')) {
   $path = Join-Path $root $unused
   if (Test-Path $path) { Remove-Item -LiteralPath $path -Recurse -Force }
 }

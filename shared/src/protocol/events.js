@@ -6,7 +6,13 @@ export const EVENTS = Object.freeze({
   // ---- client -> server ------------------------------------------------
   CREATE_ROOM: 'aeth:createRoom',   // { loadout:[ids], name? } -> ack {ok, code, slot, ...}
   ACCOUNT_AUTH: 'aeth:accountAuth', // { username, pin } temporary register/login
+  ACCOUNT_PIN_RESET: 'aeth:accountPinReset', // { resetToken, pin }
   ACCOUNT_STATUS: 'aeth:accountStatus', // {} -> authenticated account state
+  BOT_OFFER_RESPONSE: 'aeth:botOfferResponse', // { offerId, accept }
+  EMOJI: 'aeth:emoji',              // { kind:'smile'|'angry'|'cry'|'laugh' }
+  SPECTATE_LIST: 'aeth:spectateList', // {} -> up to five active ranked matches
+  SPECTATE_JOIN: 'aeth:spectateJoin', // { matchId }
+  SPECTATE_LEAVE: 'aeth:spectateLeave', // {}
   JOIN_ROOM: 'aeth:joinRoom',       // { code, loadout:[ids], name? }
   QUICK_MATCH: 'aeth:quickMatch',   // { loadout:[ids], name? } ranked compatibility path
   QUICK_MATCH_UNRANKED: 'aeth:quickMatchUnranked', // { loadout:[ids], name? }
@@ -30,6 +36,11 @@ export const EVENTS = Object.freeze({
   OPPONENT_STATUS: 'aeth:opponentStatus', // { state:'disconnected'|'returned', graceMs? }
   RESUME_TOKEN: 'aeth:resumeToken', // { token } rotated single-use token
   RANKING_UPDATE: 'aeth:rankingUpdate', // personalized Glyph result after ranked match
+  BOT_OFFER: 'aeth:botOffer',          // fallback AI offer after human search window
+  EMOJI_EVENT: 'aeth:emojiEvent',      // { sender, kind, durationMs }
+  SPECTATE_START: 'aeth:spectateStart',
+  SPECTATE_SNAPSHOT: 'aeth:spectateSnapshot',
+  SPECTATE_END: 'aeth:spectateEnd',
   ABORTED: 'aeth:aborted',          // { reason } drain / fatal
   PONG: 'aeth:pong',                // { t } echo of ping
 });
@@ -57,6 +68,7 @@ export const ERR = Object.freeze({
   INVALID_USERNAME: 'invalid-username',
   INVALID_PIN: 'invalid-pin',
   NAME_TAKEN: 'name-taken',
+  RESERVED_NAME: 'reserved-name',
 });
 
 // Queue / room lifecycle states surfaced to the client waiting UI.

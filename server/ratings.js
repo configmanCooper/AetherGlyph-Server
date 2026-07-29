@@ -14,8 +14,10 @@ export const GLYPH_TRANSFER_MAX = 50;
 export const GLYPH_TRANSFER_EQUAL = 25;
 export const SEASON_CHECK_MS = 60 * 60 * 1000;
 export const TEMP_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+export const PIN_RESET_TTL_MS = 10 * 60 * 1000;
 export const USERNAME_PATTERN = /^[A-Za-z0-9]{1,24}$/;
 export const PIN_PATTERN = /^\d{6}$/;
+export const RESERVED_BOT_NAMES = new Set(['easyaibot', 'mediumaibot', 'hardaibot']);
 
 export function normalizeUsername(value) {
   return String(value || '').trim().toLowerCase();
@@ -24,6 +26,9 @@ export function normalizeUsername(value) {
 export function validateTemporaryCredentials(username, pin) {
   if (!USERNAME_PATTERN.test(String(username || ''))) {
     return { ok: false, code: 'invalid-username' };
+  }
+  if (RESERVED_BOT_NAMES.has(normalizeUsername(username))) {
+    return { ok: false, code: 'reserved-name' };
   }
   if (!PIN_PATTERN.test(String(pin || ''))) {
     return { ok: false, code: 'invalid-pin' };
@@ -131,6 +136,7 @@ class MemoryRatingStore {
     this.results = new Map();
     this.credentials = new Map();
     this.sessions = new Map();
+    this.pinResets = new Map();
     this.credentialLocks = new Map();
     this.seasons = [];
     this.currentSeasonStart = null;
@@ -225,9 +231,23 @@ class MemoryRatingStore {
       const hash = await derivePinHash(pin, salt);
       const account = this.ensureAccount(accountId, username);
       account.displayName = username;
-      credential = { accountId, name: username, salt, hash };
+      credential = { accountId, name: username, salt, hash, pinResetRequired: false };
       this.credentials.set(usernameKey, credential);
       created = true;
+    }
+    if (credential.pinResetRequired) {
+      const resetToken = createSessionToken();
+      this.pinResets.set(hashSessionToken(resetToken), {
+        accountId: credential.accountId,
+        expiresAt: Date.now() + PIN_RESET_TTL_MS,
+      });
+      return {
+        ok: true,
+        resetRequired: true,
+        resetToken,
+        accountId: credential.accountId,
+        name: credential.name,
+      };
     }
     const token = createSessionToken();
     this.sessions.set(hashSessionToken(token), {
@@ -255,9 +275,46 @@ class MemoryRatingStore {
     }
     const account = this.accounts.get(session.accountId);
     if (!account) return null;
+    const credential = [...this.credentials.values()]
+      .find((entry) => entry.accountId === session.accountId);
+    if (credential?.pinResetRequired) return null;
     return {
       accountId: account.id,
       name: account.displayName,
+    };
+  }
+
+  async resetTemporaryPin(resetToken, pin) {
+    if (!PIN_PATTERN.test(String(pin || ''))) return { ok: false, code: 'invalid-pin' };
+    const key = hashSessionToken(resetToken);
+    const reset = this.pinResets.get(key);
+    if (!reset || reset.expiresAt <= Date.now()) {
+      for (const [resetKey, pending] of this.pinResets) {
+        if (pending.expiresAt <= Date.now()) this.pinResets.delete(resetKey);
+      }
+      return { ok: false, code: 'bad-token' };
+    }
+    const credential = [...this.credentials.values()]
+      .find((entry) => entry.accountId === reset.accountId);
+    if (!credential) return { ok: false, code: 'bad-token' };
+    credential.salt = crypto.randomBytes(16).toString('hex');
+    credential.hash = await derivePinHash(pin, credential.salt);
+    credential.pinResetRequired = false;
+    for (const [resetKey, pending] of this.pinResets) {
+      if (pending.accountId === credential.accountId) this.pinResets.delete(resetKey);
+    }
+    for (const [sessionKey, session] of this.sessions) {
+      if (session.accountId === credential.accountId) this.sessions.delete(sessionKey);
+    }
+    const token = createSessionToken();
+    this.sessions.set(hashSessionToken(token), {
+      accountId: credential.accountId,
+      expiresAt: Date.now() + TEMP_SESSION_TTL_MS,
+    });
+    const rankings = await this.getLeaderboard(credential.accountId, credential.name, 100);
+    return {
+      ok: true, accountId: credential.accountId, name: credential.name,
+      token, profile: rankings.self,
     };
   }
 
@@ -280,6 +337,9 @@ class MemoryRatingStore {
 
   async recordResult({ matchId, ranked, players, winnerSlot, reason }) {
     if (!ranked) return { matchId, ranked: false, applied: false };
+    if (players.some((player) => player.isBot)) {
+      return this.recordBotResult({ matchId, ranked, players, winnerSlot, reason });
+    }
     await this.ensureCurrentSeason();
     if (this.results.has(matchId)) return { ...this.results.get(matchId), applied: false };
     const [pa, pb] = players;
@@ -323,6 +383,55 @@ class MemoryRatingStore {
         glyphsAfter: update.glyphs[slot],
         delta: update.deltas[slot],
       })),
+    };
+    this.results.set(matchId, result);
+    return result;
+  }
+
+  async recordBotResult({ matchId, ranked, players, winnerSlot, reason }) {
+    if (!ranked) return { matchId, ranked: false, applied: false };
+    await this.ensureCurrentSeason();
+    if (this.results.has(matchId)) return { ...this.results.get(matchId), applied: false };
+    const botSlot = players.findIndex((player) => player.isBot);
+    const humanSlot = botSlot === 0 ? 1 : 0;
+    const humanPlayer = players[humanSlot];
+    const botPlayer = players[botSlot];
+    const human = this.ensureAccount(humanPlayer.accountId, humanPlayer.name);
+    const before = human.glyphs;
+    const reward = winnerSlot === humanSlot && before <= 299
+      ? Math.min(20, glyphTransfer(before, botPlayer.glyphs))
+      : 0;
+    human.glyphs += reward;
+    human.rankedGames++;
+    if (winnerSlot === 'draw' || winnerSlot == null) human.draws++;
+    else if (winnerSlot === humanSlot) human.wins++;
+    else human.losses++;
+    if (reward) human.glyphsReachedAt = Date.now();
+    const playerResults = players.map((player, slot) => {
+      if (slot === botSlot) {
+        return {
+          name: player.name,
+          glyphs: player.glyphs,
+          wins: 0, losses: 0, draws: 0, games: 0, rank: null,
+          accountId: null,
+          glyphsBefore: player.glyphs,
+          glyphsAfter: player.glyphs,
+          delta: 0,
+          isBot: true,
+        };
+      }
+      return {
+        ...publicProfile(human, this.rankOf(human.id)),
+        accountId: human.id,
+        glyphsBefore: before,
+        glyphsAfter: human.glyphs,
+        delta: reward,
+        isBot: false,
+      };
+    });
+    const result = {
+      matchId, ranked: true, applied: true, season: seasonKey(this.currentSeasonStart),
+      winnerSlot, reason, transfer: reward, players: playerResults,
     };
     this.results.set(matchId, result);
     return result;
@@ -430,7 +539,8 @@ class PostgresRatingStore {
           ADD COLUMN IF NOT EXISTS glyphs_b_before INTEGER,
           ADD COLUMN IF NOT EXISTS glyphs_delta INTEGER,
           ADD COLUMN IF NOT EXISTS glyphs_a_after INTEGER,
-          ADD COLUMN IF NOT EXISTS glyphs_b_after INTEGER
+          ADD COLUMN IF NOT EXISTS glyphs_b_after INTEGER,
+          ADD COLUMN IF NOT EXISTS bot_opponent TEXT
       `);
       await schema.query(`
         CREATE TABLE IF NOT EXISTS ranking_seasons (
@@ -458,7 +568,8 @@ class PostgresRatingStore {
       await schema.query(`
         ALTER TABLE temporary_credentials
           ADD COLUMN IF NOT EXISTS failed_attempts INTEGER NOT NULL DEFAULT 0,
-          ADD COLUMN IF NOT EXISTS blocked_until TIMESTAMPTZ
+          ADD COLUMN IF NOT EXISTS blocked_until TIMESTAMPTZ,
+          ADD COLUMN IF NOT EXISTS pin_reset_required BOOLEAN NOT NULL DEFAULT false
       `);
       await schema.query(`
         CREATE TABLE IF NOT EXISTS temporary_sessions (
@@ -467,6 +578,10 @@ class PostgresRatingStore {
           expires_at TIMESTAMPTZ NOT NULL,
           created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )`);
+      await schema.query(`
+        ALTER TABLE temporary_sessions
+          ADD COLUMN IF NOT EXISTS purpose TEXT NOT NULL DEFAULT 'session'
+      `);
       await schema.query(`
         CREATE INDEX IF NOT EXISTS temporary_sessions_expiry_idx
         ON temporary_sessions (expires_at)
@@ -544,13 +659,18 @@ class PostgresRatingStore {
     return rows[0];
   }
 
-  async issueTemporarySession(accountId) {
+  async issueTemporarySession(
+    accountId,
+    purpose = 'session',
+    ttlMs = TEMP_SESSION_TTL_MS,
+    queryable = this.pool,
+  ) {
     const token = createSessionToken();
-    const expiresAt = new Date(Date.now() + TEMP_SESSION_TTL_MS);
-    await this.pool.query(
-      `INSERT INTO temporary_sessions (token_hash, account_id, expires_at)
-       VALUES ($1, $2, $3)`,
-      [hashSessionToken(token), accountId, expiresAt],
+    const expiresAt = new Date(Date.now() + ttlMs);
+    await queryable.query(
+      `INSERT INTO temporary_sessions (token_hash, account_id, expires_at, purpose)
+       VALUES ($1, $2, $3, $4)`,
+      [hashSessionToken(token), accountId, expiresAt, purpose],
     );
     return token;
   }
@@ -559,9 +679,15 @@ class PostgresRatingStore {
     const validation = validateTemporaryCredentials(username, pin);
     if (!validation.ok) return validation;
     const usernameKey = normalizeUsername(username);
-    const existing = await this.pool.query(
+    const client = await this.pool.connect();
+    try {
+      await client.query(
+        `SELECT pg_advisory_lock(hashtext($1))`,
+        [`aetherglyph-pin:${usernameKey}`],
+      );
+    const existing = await client.query(
       `SELECT c.account_id, c.pin_salt, c.pin_hash, c.failed_attempts,
-         c.blocked_until, a.display_name
+         c.blocked_until, c.pin_reset_required, a.display_name
        FROM temporary_credentials c
        JOIN accounts a ON a.id = c.account_id
        WHERE c.username_key = $1`,
@@ -579,7 +705,7 @@ class PostgresRatingStore {
       const expected = Buffer.from(credential.pin_hash, 'hex');
       const actual = Buffer.from(hash, 'hex');
       if (actual.length !== expected.length || !crypto.timingSafeEqual(actual, expected)) {
-        await this.pool.query(
+        await client.query(
           `UPDATE temporary_credentials SET
              failed_attempts = failed_attempts + 1,
              blocked_until = CASE
@@ -596,7 +722,7 @@ class PostgresRatingStore {
         );
         return { ok: false, code: 'name-taken' };
       }
-      await this.pool.query(
+      await client.query(
         `UPDATE temporary_credentials
          SET failed_attempts = 0, blocked_until = NULL
          WHERE username_key = $1`,
@@ -609,7 +735,6 @@ class PostgresRatingStore {
       displayName = username;
       const salt = crypto.randomBytes(16).toString('hex');
       const hash = await derivePinHash(pin, salt);
-      const client = await this.pool.connect();
       try {
         await client.query('BEGIN');
         await client.query(
@@ -627,7 +752,7 @@ class PostgresRatingStore {
         );
         if (!inserted.rows.length) {
           await client.query('ROLLBACK');
-          return this.authenticateTemporary(username, pin);
+          return { ok: false, code: 'name-taken' };
         }
         await client.query(
           `INSERT INTO account_identities (provider, provider_user_id, account_id)
@@ -639,24 +764,39 @@ class PostgresRatingStore {
         created = true;
       } catch (error) {
         try { await client.query('ROLLBACK'); } catch { /* original error wins */ }
-        if (error?.code === '23505') return this.authenticateTemporary(username, pin);
+        if (error?.code === '23505') return { ok: false, code: 'name-taken' };
         throw error;
-      } finally {
-        client.release();
       }
     }
 
-    await this.pool.query('DELETE FROM temporary_sessions WHERE expires_at <= now()');
-    const token = await this.issueTemporarySession(accountId);
-    const rankings = await this.getLeaderboard(accountId, displayName, 100);
+    await client.query('DELETE FROM temporary_sessions WHERE expires_at <= now()');
+    if (existing.rows[0]?.pin_reset_required) {
+      const resetToken = await this.issueTemporarySession(
+        accountId, 'pin-reset', PIN_RESET_TTL_MS, client,
+      );
+      return {
+        ok: true, resetRequired: true, resetToken,
+        accountId, name: displayName,
+      };
+    }
+    const token = await this.issueTemporarySession(accountId, 'session', TEMP_SESSION_TTL_MS, client);
     return {
       ok: true,
       created,
       accountId,
       name: displayName,
       token,
-      profile: rankings.self,
+      profile: null,
     };
+    } finally {
+      try {
+        await client.query(
+          `SELECT pg_advisory_unlock(hashtext($1))`,
+          [`aetherglyph-pin:${usernameKey}`],
+        );
+      } catch { /* original result/error remains authoritative */ }
+      client.release();
+    }
   }
 
   async resolveTemporarySession(token) {
@@ -665,13 +805,91 @@ class PostgresRatingStore {
       `SELECT s.account_id, a.display_name
        FROM temporary_sessions s
        JOIN accounts a ON a.id = s.account_id
-       WHERE s.token_hash = $1 AND s.expires_at > now()`,
+       JOIN temporary_credentials c ON c.account_id = s.account_id
+       WHERE s.token_hash = $1 AND s.expires_at > now()
+         AND s.purpose = 'session' AND c.pin_reset_required = false`,
       [hashSessionToken(token)],
     );
     if (!rows.length) return null;
     return {
       accountId: rows[0].account_id,
       name: rows[0].display_name,
+    };
+  }
+
+  async resetTemporaryPin(resetToken, pin) {
+    if (!PIN_PATTERN.test(String(pin || ''))) return { ok: false, code: 'invalid-pin' };
+    if (typeof resetToken !== 'string' || resetToken.length < 20 || resetToken.length > 256) {
+      return { ok: false, code: 'bad-token' };
+    }
+    const salt = crypto.randomBytes(16).toString('hex');
+    const pinHash = await derivePinHash(pin, salt);
+    const sessionToken = createSessionToken();
+    const client = await this.pool.connect();
+    let accountId;
+    let displayName;
+    try {
+      await client.query('BEGIN');
+      const preliminary = await client.query(
+        `SELECT c.username_key
+         FROM temporary_sessions s
+         JOIN temporary_credentials c ON c.account_id = s.account_id
+         WHERE s.token_hash = $1 AND s.expires_at > now()
+           AND s.purpose = 'pin-reset'`,
+        [hashSessionToken(resetToken)],
+      );
+      if (!preliminary.rows.length) {
+        await client.query('ROLLBACK');
+        return { ok: false, code: 'bad-token' };
+      }
+      await client.query(
+        `SELECT pg_advisory_xact_lock(hashtext($1))`,
+        [`aetherglyph-pin:${preliminary.rows[0].username_key}`],
+      );
+      const reset = await client.query(
+        `SELECT s.account_id, a.display_name
+         FROM temporary_sessions s
+         JOIN accounts a ON a.id = s.account_id
+         JOIN temporary_credentials c ON c.account_id = s.account_id
+         WHERE s.token_hash = $1 AND s.expires_at > now()
+           AND s.purpose = 'pin-reset' AND c.pin_reset_required = true
+         FOR UPDATE OF s, c`,
+        [hashSessionToken(resetToken)],
+      );
+      if (!reset.rows.length) {
+        await client.query('ROLLBACK');
+        return { ok: false, code: 'bad-token' };
+      }
+      accountId = reset.rows[0].account_id;
+      displayName = reset.rows[0].display_name;
+      await client.query(
+        `UPDATE temporary_credentials SET pin_salt = $2, pin_hash = $3,
+           pin_reset_required = false, failed_attempts = 0, blocked_until = NULL
+         WHERE account_id = $1`,
+        [accountId, salt, pinHash],
+      );
+      await client.query('DELETE FROM temporary_sessions WHERE account_id = $1', [accountId]);
+      await client.query(
+        `INSERT INTO temporary_sessions (
+           token_hash, account_id, expires_at, purpose
+         ) VALUES ($1, $2, $3, 'session')`,
+        [
+          hashSessionToken(sessionToken),
+          accountId,
+          new Date(Date.now() + TEMP_SESSION_TTL_MS),
+        ],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      try { await client.query('ROLLBACK'); } catch { /* original error wins */ }
+      throw error;
+    } finally {
+      client.release();
+    }
+    const rankings = await this.getLeaderboard(accountId, displayName, 100);
+    return {
+      ok: true, accountId, name: displayName,
+      token: sessionToken, profile: rankings.self,
     };
   }
 
@@ -759,7 +977,7 @@ class PostgresRatingStore {
 
   async loadStoredResult(queryable, matchId, players) {
     const stored = await queryable.query(
-      `SELECT match_id, ranked, winner_slot, reason, account_a, account_b,
+      `SELECT match_id, ranked, winner_slot, reason, account_a, account_b, bot_opponent,
          glyphs_a_before, glyphs_b_before, glyphs_delta,
          glyphs_a_after, glyphs_b_after
        FROM match_results
@@ -772,7 +990,7 @@ class PostgresRatingStore {
         || row.glyphs_a_after == null || row.glyphs_b_after == null) {
       return { matchId, ranked: !!row.ranked, applied: false };
     }
-    const accountIds = [row.account_a, row.account_b];
+    const accountIds = [row.account_a, row.account_b].filter(Boolean);
     const rankedProfiles = await queryable.query(
       `WITH ranked AS (
          SELECT id, display_name, glyphs, ranked_games, ranked_wins,
@@ -793,6 +1011,33 @@ class PostgresRatingStore {
     );
     const before = [Number(row.glyphs_a_before), Number(row.glyphs_b_before)];
     const after = [Number(row.glyphs_a_after), Number(row.glyphs_b_after)];
+    const storedPlayers = [row.account_a, row.account_b].map((accountId, slot) => {
+      if (!accountId) {
+        const source = players?.[slot] || {};
+        return {
+          name: row.bot_opponent || source.name || 'AI bot',
+          glyphs: after[slot], wins: 0, losses: 0, draws: 0, games: 0, rank: null,
+          accountId: null, glyphsBefore: before[slot], glyphsAfter: after[slot],
+          delta: 0, isBot: true,
+        };
+      }
+      const profile = profilesById.get(accountId);
+      return {
+        ...publicProfile({
+          displayName: profile?.display_name || players?.[slot]?.name,
+          glyphs: after[slot],
+          rankedGames: profile?.ranked_games,
+          wins: profile?.ranked_wins,
+          losses: profile?.ranked_losses,
+          draws: profile?.ranked_draws,
+        }, profile?.world_rank ?? null),
+        accountId,
+        glyphsBefore: before[slot],
+        glyphsAfter: after[slot],
+        delta: after[slot] - before[slot],
+        isBot: false,
+      };
+    });
     return {
       matchId,
       ranked: true,
@@ -801,27 +1046,12 @@ class PostgresRatingStore {
       winnerSlot: row.winner_slot == null ? 'draw' : Number(row.winner_slot),
       reason: row.reason,
       transfer: Number(row.glyphs_delta) || 0,
-      players: accountIds.map((accountId, slot) => {
-        const profile = profilesById.get(accountId);
-        return {
-          ...publicProfile({
-            displayName: profile?.display_name || players?.[slot]?.name,
-            glyphs: after[slot],
-            rankedGames: profile?.ranked_games,
-            wins: profile?.ranked_wins,
-            losses: profile?.ranked_losses,
-            draws: profile?.ranked_draws,
-          }, profile?.world_rank ?? null),
-          accountId,
-          glyphsBefore: before[slot],
-          glyphsAfter: after[slot],
-          delta: after[slot] - before[slot],
-        };
-      }),
+      players: storedPlayers,
     };
   }
 
   async recordResult(args) {
+    if (args.players?.some((player) => player.isBot)) return this.recordBotResult(args);
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         return await this.recordResultOnce(args);
@@ -838,6 +1068,137 @@ class PostgresRatingStore {
       }
     }
     return null;
+  }
+
+  async recordBotResult(args) {
+          for (let attempt = 0; attempt < 3; attempt++) {
+            try {
+              return await this.recordBotResultOnce(args);
+            } catch (error) {
+              if (error?.ambiguousCommit) {
+                try {
+                  const stored = await this.loadStoredResult(this.pool, args.matchId, args.players);
+                  if (stored?.players) return stored;
+                } catch { /* retry below */ }
+              }
+              const retryable = error?.ambiguousCommit || ['40P01', '40001'].includes(error?.code);
+              if (!retryable || attempt === 2) throw error;
+              await new Promise((resolve) => setTimeout(resolve, 25 * (attempt + 1)));
+            }
+          }
+          return null;
+        }
+
+  async recordBotResultOnce({ matchId, ranked, players, winnerSlot, reason }) {
+          if (!ranked) return { matchId, ranked: false, applied: false };
+          const botSlot = players.findIndex((player) => player.isBot);
+          if (botSlot < 0) return this.recordResultOnce({ matchId, ranked, players, winnerSlot, reason });
+          const humanSlot = botSlot === 0 ? 1 : 0;
+          const humanPlayer = players[humanSlot];
+          const botPlayer = players[botSlot];
+          const client = await this.pool.connect();
+          let commitStarted = false;
+          try {
+            await client.query('BEGIN');
+            await client.query(`SELECT pg_advisory_xact_lock(hashtext('aetherglyph-quarterly-ranking-reset'))`);
+            const season = await this.ensureCurrentSeasonInTransaction(client, new Date());
+            const inserted = await client.query(
+              `INSERT INTO match_results (
+                 match_id, ranked, winner_slot, account_a, account_b, reason, bot_opponent
+               ) VALUES ($1, true, $2, $3, $4, $5, $6)
+               ON CONFLICT (match_id) DO NOTHING RETURNING match_id`,
+              [
+                matchId,
+                winnerSlot === 'draw' || winnerSlot == null ? null : winnerSlot,
+                humanSlot === 0 ? humanPlayer.accountId : null,
+                humanSlot === 1 ? humanPlayer.accountId : null,
+                reason || null,
+                botPlayer.name,
+              ],
+            );
+            if (!inserted.rows.length) {
+              const stored = await this.loadStoredResult(client, matchId, players);
+              commitStarted = true;
+              await client.query('COMMIT');
+              commitStarted = false;
+              return stored;
+            }
+            await this.ensureAccount(client, humanPlayer.accountId, humanPlayer.name);
+            const locked = await client.query(
+              `SELECT id, display_name, glyphs, ranked_games, ranked_wins,
+                 ranked_losses, ranked_draws
+               FROM accounts WHERE id = $1 FOR UPDATE`,
+              [humanPlayer.accountId],
+            );
+            const human = locked.rows[0];
+            const before = Number(human.glyphs);
+            const reward = winnerSlot === humanSlot && before <= 299
+              ? Math.min(20, glyphTransfer(before, Number(botPlayer.glyphs)))
+              : 0;
+            const after = before + reward;
+            const won = winnerSlot === humanSlot ? 1 : 0;
+            const lost = winnerSlot === botSlot ? 1 : 0;
+            const drew = winnerSlot === 'draw' || winnerSlot == null ? 1 : 0;
+            await client.query(
+              `UPDATE accounts SET glyphs = $2, games = games + 1,
+                 ranked_games = ranked_games + 1, ranked_wins = ranked_wins + $3,
+                 ranked_losses = ranked_losses + $4, ranked_draws = ranked_draws + $5,
+                 glyphs_reached_at = CASE WHEN glyphs <> $2 THEN now() ELSE glyphs_reached_at END,
+                 updated_at = now()
+               WHERE id = $1`,
+              [humanPlayer.accountId, after, won, lost, drew],
+            );
+            const beforeBySlot = humanSlot === 0 ? [before, botPlayer.glyphs] : [botPlayer.glyphs, before];
+            const afterBySlot = humanSlot === 0 ? [after, botPlayer.glyphs] : [botPlayer.glyphs, after];
+            await client.query(
+              `UPDATE match_results SET glyphs_a_before = $2, glyphs_b_before = $3,
+                 glyphs_delta = $4, glyphs_a_after = $5, glyphs_b_after = $6
+               WHERE match_id = $1`,
+              [matchId, beforeBySlot[0], beforeBySlot[1], reward, afterBySlot[0], afterBySlot[1]],
+            );
+            const rankResult = await client.query(
+              `WITH ranked AS (
+                 SELECT id, ROW_NUMBER() OVER (
+                   ORDER BY glyphs DESC, ranked_wins DESC, ranked_losses ASC,
+                     glyphs_reached_at ASC, id ASC
+                 ) AS world_rank
+                 FROM accounts WHERE ranked_games > 0
+               ) SELECT world_rank FROM ranked WHERE id = $1`,
+              [humanPlayer.accountId],
+            );
+            const humanResult = {
+              ...publicProfile({
+                displayName: human.display_name, glyphs: after,
+                rankedGames: Number(human.ranked_games) + 1,
+                wins: Number(human.ranked_wins) + won,
+                losses: Number(human.ranked_losses) + lost,
+                draws: Number(human.ranked_draws) + drew,
+              }, rankResult.rows[0]?.world_rank ?? null),
+              accountId: humanPlayer.accountId, glyphsBefore: before,
+              glyphsAfter: after, delta: reward, isBot: false,
+            };
+            const botResult = {
+              name: botPlayer.name, glyphs: botPlayer.glyphs,
+              wins: 0, losses: 0, draws: 0, games: 0, rank: null,
+              accountId: null, glyphsBefore: botPlayer.glyphs,
+              glyphsAfter: botPlayer.glyphs, delta: 0, isBot: true,
+            };
+            const result = {
+              matchId, ranked: true, applied: true, season: season.season,
+              winnerSlot, reason, transfer: reward,
+              players: humanSlot === 0 ? [humanResult, botResult] : [botResult, humanResult],
+            };
+            commitStarted = true;
+            await client.query('COMMIT');
+            commitStarted = false;
+            return result;
+          } catch (error) {
+            if (commitStarted) error.ambiguousCommit = true;
+            try { await client.query('ROLLBACK'); } catch { /* original error wins */ }
+            throw error;
+          } finally {
+            client.release();
+          }
   }
 
   async recordResultOnce({ matchId, ranked, players, winnerSlot, reason }) {
