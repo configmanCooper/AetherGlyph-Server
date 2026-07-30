@@ -275,7 +275,7 @@ export const GESTURE_TEMPLATES = {
   ],
   phoenixWing: [ // 39 Phoenix Covenant — spread wings with a tall central peak
     [{ x: 10, y: 72 }, { x: 28, y: 36 }, { x: 40, y: 56 }, { x: 50, y: 18 },
-     { x: 60, y: 56 }, { x: 72, y: 36 }, { x: 90, y: 72 }],
+     { x: 60, y: 56 }, { x: 72, y: 36 }, { x: 90, y: 72 }, { x: 10, y: 72 }],
   ],
   starLine: [ // 40 Prismatic Beam — six-spoke radial star (asterisk)
     [{ x: 50, y: 50 }, { x: 50, y: 10 }, { x: 50, y: 50 }, { x: 85, y: 30 },

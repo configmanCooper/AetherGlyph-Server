@@ -21,6 +21,7 @@ import {
 import { signToken, randomId } from './tokens.js';
 import { TokenBucket } from './util.js';
 import { PracticeBot } from '../shared/src/bot/practiceBot.js';
+import { MATCH } from '../shared/src/sim/constants.js';
 
 const TICK_MS = 1000 / NET.TICK_HZ;
 const MAX_CATCHUP = 6;
@@ -28,6 +29,40 @@ const INTERMISSION_MS = 2800;
 const EMOJI_KINDS = new Set(['smile', 'angry', 'cry', 'laugh']);
 const EMOJI_COOLDOWN_MS = 10000;
 const EMOJI_DURATION_MS = 2000;
+const BOT_EMOJI_HEALTH_THRESHOLD = MATCH.startHealth * 0.25;
+const BOT_EMOJI_AMBIENT_TICKS = NET.TICK_HZ * 2;
+
+export function chooseBotEmojiReaction({
+  botSlot,
+  events = [],
+  wizards = [],
+  ambient = false,
+  random = () => 1,
+} = {}) {
+  const bot = wizards[botSlot];
+  const opponentSlot = botSlot === 0 ? 1 : 0;
+  const opponent = wizards[opponentSlot];
+  if (!bot || !opponent) return null;
+
+  const botLow = bot.health <= BOT_EMOJI_HEALTH_THRESHOLD;
+  const opponentLow = opponent.health <= BOT_EMOJI_HEALTH_THRESHOLD;
+  const tookDamage = events.some((event) =>
+    event?.type === 'damage' && event.target === botSlot && Number(event.amount) > 0);
+  const dealtDamage = events.some((event) =>
+    event?.type === 'damage' && event.target === opponentSlot && Number(event.amount) > 0);
+
+  if (tookDamage && random() < (botLow ? 0.75 : 0.42)) {
+    if (botLow) return 'cry';
+    return random() < 0.55 ? 'cry' : 'angry';
+  }
+  if (dealtDamage && random() < (opponentLow ? 0.68 : 0.32)) {
+    if (opponentLow) return 'laugh';
+    return random() < 0.58 ? 'smile' : 'laugh';
+  }
+  if (ambient && botLow && random() < 0.2) return 'cry';
+  if (ambient && opponentLow && random() < 0.18) return 'laugh';
+  return null;
+}
 
 // A single full-roster template set is shared by every match. Building it once
 // keeps authoritative classification deterministic + cheap.
@@ -104,6 +139,7 @@ export class MatchRoom {
     this.closed = false;
     this.spectators = new Map();
     this.lastCasts = [null, null];
+    this.botEmojiRngState = (this.seed ^ 0x454d4f4a) >>> 0 || 1;
   }
 
   seatBySocketId(id) { return this.seats.find((s) => s.socket && s.socket.id === id); }
@@ -238,6 +274,7 @@ export class MatchRoom {
         this.lastCasts[e.caster] = e.spellId;
       }
     }
+    this.updateBotEmojiReactions(evs);
     this.tickCount += 1;
     if (this.sim.ended) { this.handleRoundEnd(); return; }
     if (this.tickCount % NET.SNAPSHOT_EVERY_TICKS === 0) this.broadcastSnapshot(false);
@@ -266,6 +303,31 @@ export class MatchRoom {
       seat.pendingReject = false;
     }
     return intent;
+  }
+
+  nextBotEmojiRandom() {
+    let state = this.botEmojiRngState;
+    state ^= state << 13;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    this.botEmojiRngState = state >>> 0 || 1;
+    return this.botEmojiRngState / 0x100000000;
+  }
+
+  updateBotEmojiReactions(events, random = () => this.nextBotEmojiRandom()) {
+    if (this.state !== 'live') return;
+    const ambient = this.tickCount % BOT_EMOJI_AMBIENT_TICKS === 0;
+    for (const seat of this.seats) {
+      if (!seat.isBot || seat.emojiReadyAt > Date.now()) continue;
+      const kind = chooseBotEmojiReaction({
+        botSlot: seat.slot,
+        events,
+        wizards: this.sim?.wizards,
+        ambient,
+        random,
+      });
+      if (kind) this.emitEmoji(seat.slot, kind);
+    }
   }
 
   // ---- snapshots ---------------------------------------------------------
@@ -468,6 +530,13 @@ export class MatchRoom {
         cooldownMs: seat.emojiReadyAt - now,
       };
     }
+    this.emitEmoji(slot, kind, now);
+    return { ok: true, cooldownMs: EMOJI_COOLDOWN_MS };
+  }
+
+  emitEmoji(slot, kind, now = Date.now()) {
+    const seat = this.seats[slot];
+    if (!seat || !EMOJI_KINDS.has(kind)) return false;
     seat.emojiReadyAt = now + EMOJI_COOLDOWN_MS;
     for (const recipient of this.seats) {
       if (!recipient.socket) continue;
@@ -480,7 +549,7 @@ export class MatchRoom {
       });
     }
     this.broadcastEmojiToSpectators(slot, kind, EMOJI_DURATION_MS);
-    return { ok: true, cooldownMs: EMOJI_COOLDOWN_MS };
+    return true;
   }
 
   broadcastEmojiToSpectators(sender, kind, durationMs) {
